@@ -1,0 +1,6 @@
+# ignore .lock files
+*.lock
+
+# setup files
+fetch-fpl-data.py
+update.py
