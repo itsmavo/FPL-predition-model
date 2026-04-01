@@ -64,7 +64,7 @@ triggers automatic model retraining.
  
 ```
 FPL-prediction-model/
-├── fpl_team_generator.py   # Main script — all logic in one file
+├── fpl-team-gen.py   # Main script — all logic in one file
 ├── README.md
 ├── .gitignore
 │
@@ -174,13 +174,13 @@ FPL-prediction-model/
  
 ```bash
 # Best team for next gameweek (trains models on first run)
-python3 fpl-team-generator.py -g
+python3 fpl-team-gen.py -g
  
 # Best team for season remainder
-python3 fpl-team-generator.py -s
+python3 fpl-team-gen.py -s
  
 # Fast heuristic pick — no ML training needed
-python3 fpl-team-generator.py -c
+python3 fpl-team-gen.py -c
 ```
  
 **First run output** will look like this:
