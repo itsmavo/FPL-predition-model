@@ -174,13 +174,13 @@ FPL-prediction-model/
  
 ```bash
 # Best team for next gameweek (trains models on first run)
-python3 fpl_team_generator.py -g
+python3 fpl-team-generator.py -g
  
 # Best team for season remainder
-python3 fpl_team_generator.py -s
+python3 fpl-team-generator.py -s
  
 # Fast heuristic pick — no ML training needed
-python3 fpl_team_generator.py -c
+python3 fpl-team-generator.py -c
 ```
  
 **First run output** will look like this:
@@ -231,7 +231,7 @@ Subsequent runs skip training and load saved model weights in under a second.
 ## CLI Reference
  
 ```
-python3 fpl_team_generator.py [MODE] [OPTIONS]
+python3 fpl-team-gen.py [MODE] [OPTIONS]
 ```
  
 ### Team Selection Modes
@@ -241,7 +241,7 @@ These flags are mutually exclusive — only one can be used at a time.
 #### `-g` / `--gameweek` — Best team for next gameweek *(default)*
  
 ```bash
-python3 fpl_team_generator.py -g
+python3 fpl-team-gen.py -g
 ```
  
 Uses **Model A** (LightGBM) trained on historical FPL data to predict each
@@ -256,7 +256,7 @@ This is the mode you will use most often — run it before each gameweek deadlin
 #### `-s` / `--season` — Best team for season remainder
  
 ```bash
-python3 fpl_team_generator.py -s
+python3 fpl-team-gen.py -s
 ```
  
 Uses **Model B** (XGBoost) trained to predict each player's cumulative total
@@ -271,7 +271,7 @@ where long-term value matters more than immediate returns.
 #### `-c` / `--current` — Current season stats only
  
 ```bash
-python3 fpl_team_generator.py -c
+python3 fpl-team-gen.py -c
 ```
  
 Bypasses all ML models entirely. Uses only live FPL API data — points-per-game
@@ -293,7 +293,7 @@ database only.
 #### `--summary` — Season accuracy report
  
 ```bash
-python3 fpl_team_generator.py --summary
+python3 fpl-team-gen.py --summary
 ```
  
 Prints a full breakdown of every gameweek tracked so far:
@@ -325,7 +325,7 @@ Prints a full breakdown of every gameweek tracked so far:
 #### `--history GW` — View a past gameweek's squad
  
 ```bash
-python3 fpl_team_generator.py --history 8
+python3 fpl-team-gen.py --history 8
 ```
  
 Prints the 15-man squad selected in gameweek 8, including predicted points,
@@ -336,7 +336,7 @@ actual points (if recorded), price at the time, and captain flag.
 #### `--record GW player_id:pts ...` — Log actual points
  
 ```bash
-python3 fpl_team_generator.py --record 28 123:12 456:6 789:2 321:9
+python3 fpl-team-gen.py --record 28 123:12 456:6 789:2 321:9
 ```
  
 Call this after a gameweek finishes to record actual FPL points against each
@@ -363,7 +363,7 @@ team selection mode.
 #### `--retrain` — Force model retraining
  
 ```bash
-python3 fpl_team_generator.py -g --retrain
+python3 fpl-team-gen.py -g --retrain
 ```
  
 Deletes and rebuilds all three saved model files from scratch using the vaastav
@@ -380,7 +380,7 @@ skips training entirely.
 #### `--importance` — Feature importance table
  
 ```bash
-python3 fpl_team_generator.py --importance
+python3 fpl-team-gen.py --importance
 ```
  
 Prints the top 17 most predictive features from Model A (LightGBM), ranked by
@@ -404,7 +404,7 @@ poor predictions.
 #### `--gw N` — Override gameweek number
  
 ```bash
-python3 fpl_team_generator.py -g --gw 32
+python3 fpl-team-gen.py -g --gw 32
 ```
  
 By default the script infers the current gameweek from the next unplayed fixture.
@@ -416,7 +416,7 @@ deadline or if you want to label a run with a specific GW number in the tracker.
 #### `--no-save` — Run without saving to tracker
  
 ```bash
-python3 fpl_team_generator.py -g --no-save
+python3 fpl-team-gen.py -g --no-save
 ```
  
 Generates and prints the team without writing anything to `fpl_tracker.db`.
@@ -433,7 +433,7 @@ Here is the recommended weekly routine:
  
 ```bash
 # Generate your team for the upcoming GW
-python3 fpl_team_generator.py -g
+python3 fpl-team-gen.py -g
 ```
  
 Review the output, make your transfers on the FPL website, then re-run if needed.
@@ -442,7 +442,7 @@ Review the output, make your transfers on the FPL website, then re-run if needed
  
 ```bash
 # Log actual points — get player IDs from --history or fpl_tracker.db
-python3 fpl_team_generator.py --record 28 \
+python3 fpl-team-gen.py --record 28 \
   123:12 456:6 789:2 321:9 654:6 \
   987:8 147:2 258:3 369:6 741:1 \
   852:9 963:6 174:2 285:6 396:3
@@ -451,14 +451,14 @@ python3 fpl_team_generator.py --record 28 \
 ### Anytime — check your season stats
  
 ```bash
-python3 fpl_team_generator.py --summary
+python3 fpl-team-gen.py --summary
 ```
  
 ### Wildcard / free hit planning
  
 ```bash
 # See what the model thinks is the best squad for the rest of the season
-python3 fpl_team_generator.py -s
+python3 fpl-team-gen.py -s
 ```
  
 ### Start of new season — update data and retrain
@@ -468,7 +468,7 @@ python3 fpl_team_generator.py -s
 cd vaastav_data && git pull && cd ..
  
 # Force retrain all three models
-python3 fpl_team_generator.py -g --retrain
+python3 fpl-team-gen.py -g --retrain
 ```
  
 ---
