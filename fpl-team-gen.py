@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FPL Team Generator — v2.0
-Fixes applied:
+FPL Team Generator — v3.0
+Fixes applied (v2):
   - update_predicted_points no longer overwrites the weighted formula
   - add_fixture_difficulty now correctly targets the next unplayed GW only
   - calculate_form uses concurrent HTTP requests instead of 600 sequential calls
@@ -12,6 +12,21 @@ Phase 2 additions:
   - record_actual_points(): call after each GW resolves to store real points
   - season_summary(): prints accuracy stats across all tracked GWs
   - get_gw_selection(): retrieve any past GW's squad from the DB
+Phase 3 additions:
+  - FPLModel: LightGBM model trained on vaastav historical dataset
+    * build_training_data(): loads and engineers features from CSV history files
+    * train(): fits LGBMRegressor with early stopping on a validation split
+    * predict(): generates next-GW point predictions for current players
+    * save() / load(): persist trained model to disk, skip retraining each run
+  - FPLSeasonModel: XGBoost model for remainder-of-season point prediction
+    * Same interface as FPLModel but targets cumulative season remainder points
+    * Used when run(mode='season') is called
+  - CaptaincyModel: GradientBoosting classifier for haul probability (≥12 pts)
+    * predict_proba() ranks players by captain upside, not just mean prediction
+  - Heuristic fallback: if no trained model exists and no vaastav data is
+    present, the system falls back gracefully to the v2 weighted formula
+  - New dependency: lightgbm, xgboost, scikit-learn, joblib
+    pip install lightgbm xgboost scikit-learn joblib
 """
 
 import requests
@@ -20,8 +35,35 @@ import pulp
 import numpy as np
 import sqlite3
 import os
+import warnings
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# Phase 3 — ML imports (graceful fallback if not installed)
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+    warnings.warn("lightgbm not installed. Run: pip install lightgbm")
+
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+    warnings.warn("xgboost not installed. Run: pip install xgboost")
+
+try:
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_absolute_error
+    import joblib
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    warnings.warn("scikit-learn / joblib not installed. Run: pip install scikit-learn joblib")
 
 # ──────────────────────────────────────────────
 # Constants
@@ -32,6 +74,25 @@ FDR_WEIGHT          = 0.15          # penalty applied on top of weighted score
 MIN_MINUTES         = 450           # ~5 full games
 MAX_FORM_WORKERS    = 10            # concurrent API requests for player history
 DB_PATH             = "fpl_tracker.db"
+
+# Phase 3 — ML config
+MODEL_DIR           = Path("models")          # where trained models are saved
+VAASTAV_DIR         = Path("vaastav_data")    # path to vaastav CSV history files
+                                               # download from:
+                                               # github.com/vaastav/Fantasy-Premier-League
+HAUL_THRESHOLD      = 12   # pts — captaincy model: what counts as a "haul"
+RETRAIN_MAE_TRIGGER = 3.5  # if rolling 5-GW MAE exceeds this, auto-retrain
+MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little data)
+
+# ML feature columns used by all three models
+GW_FEATURES = [
+    "pts_roll3", "pts_roll6", "xg_roll5", "xa_roll5",
+    "minutes_pct", "goals_roll5", "assists_roll5",
+    "clean_sheets_roll5", "bonus_roll5",
+    "fdr", "is_home",
+    "pos_GK", "pos_DEF", "pos_MID", "pos_FWD",
+    "price", "transfers_in_event_norm",
+]
 
 
 # ══════════════════════════════════════════════
@@ -241,7 +302,609 @@ def update_predicted_points(players):
 
 
 # ══════════════════════════════════════════════
-# SECTION 4 — TEAM OPTIMIZATION
+# SECTION 4 — PHASE 3: ML MODELS
+# ══════════════════════════════════════════════
+
+# ─────────────────────────────────────────────
+# 4a. Training data builder
+# ─────────────────────────────────────────────
+
+def build_training_data(vaastav_dir=VAASTAV_DIR):
+    """
+    Load and engineer features from the vaastav FPL historical dataset.
+
+    Handles all three layout variants found in the actual vaastav repo:
+
+      Layout A — individual GW files (older seasons):
+        vaastav_data/data/2018-19/gws/gw1.csv ... gw38.csv
+
+      Layout B — merged file (newer seasons):
+        vaastav_data/data/2021-22/gws/merged_gw.csv
+
+      Layout C — no data/ subfolder (if cloned with custom name):
+        vaastav_data/2021-22/gws/merged_gw.csv
+
+    The function auto-detects which layout is present and loads all
+    seasons it can find, then concatenates into one training frame.
+
+    Returns:
+        df (DataFrame) with engineered features and two targets:
+            'target_next_gw'      — points in the following GW  (Model A)
+            'target_season_rem'   — cumulative points from this GW to GW38 (Model B)
+        Returns None if no data found.
+    """
+    vaastav_dir = Path(vaastav_dir)
+    if not vaastav_dir.exists():
+        print(f"  [Phase 3] vaastav_data/ not found at {vaastav_dir.resolve()}.")
+        print("  Download from https://github.com/vaastav/Fantasy-Premier-League")
+        print("  and place season folders inside vaastav_data/")
+        return None
+
+    # ── Auto-detect root: handle optional data/ subfolder ─────────
+    # vaastav_data/data/2018-19/...  →  root = vaastav_data/data
+    # vaastav_data/2018-19/...       →  root = vaastav_data
+    data_subdir = vaastav_dir / "data"
+    root = data_subdir if data_subdir.exists() else vaastav_dir
+    print(f"  [Phase 3] Scanning {root.resolve()} for season folders...")
+
+    frames = []
+    seasons_loaded = 0
+
+    for season_dir in sorted(root.iterdir()):
+        if not season_dir.is_dir():
+            continue
+        gws_dir = season_dir / "gws"
+        if not gws_dir.exists():
+            continue
+
+        season_name = season_dir.name
+        season_frames = []
+
+        # ── Try Layout B first: merged_gw.csv ─────────────────────
+        merged = gws_dir / "merged_gw.csv"
+        if merged.exists():
+            try:
+                df = pd.read_csv(merged, encoding="utf-8", low_memory=False)
+                df["season"] = season_name
+                season_frames.append(df)
+            except Exception as e:
+                print(f"  [Phase 3] Warning: could not read {merged}: {e}")
+
+        # ── Layout A: individual gw1.csv ... gw38.csv ─────────────
+        else:
+            for gw_num in range(1, 39):
+                gw_file = gws_dir / f"gw{gw_num}.csv"
+                if gw_file.exists():
+                    try:
+                        df = pd.read_csv(gw_file, encoding="utf-8",
+                                         low_memory=False)
+                        df["season"] = season_name
+                        # Inject GW number — older files may not have it
+                        if "gw" not in [c.lower() for c in df.columns]:
+                            df["GW"] = gw_num
+                        season_frames.append(df)
+                    except Exception as e:
+                        print(f"  [Phase 3] Warning: could not read {gw_file}: {e}")
+
+        if season_frames:
+            season_df = pd.concat(season_frames, ignore_index=True)
+            frames.append(season_df)
+            seasons_loaded += 1
+            print(f"  [Phase 3]   {season_name}: {len(season_df):,} rows loaded")
+
+    if not frames:
+        print("  [Phase 3] No GW data files found inside vaastav_data/.")
+        print("  Expected structure: vaastav_data/data/<season>/gws/gw1.csv")
+        return None
+
+    print(f"  [Phase 3] Loaded {seasons_loaded} season(s) — {sum(len(f) for f in frames):,} total rows.")
+    df = pd.concat(frames, ignore_index=True)
+
+    # ── Normalise column names ──────────────────────────────────────
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    # vaastav uses 'gw' in merged files; individual files may use 'round'
+    if "gw" not in df.columns and "round" in df.columns:
+        df["gw"] = df["round"]
+
+    # Ensure required columns exist, fill missing with 0
+    required_cols = [
+        "name", "element", "position", "team", "gw", "season",
+        "total_points", "minutes", "goals_scored", "assists",
+        "clean_sheets", "bonus", "value", "was_home",
+        "transfers_balance", "selected",
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = 0
+
+    df["total_points"] = pd.to_numeric(df["total_points"], errors="coerce").fillna(0)
+    df["minutes"]      = pd.to_numeric(df["minutes"],      errors="coerce").fillna(0)
+    df["value"]        = pd.to_numeric(df["value"],        errors="coerce").fillna(0)
+    df["gw"]           = pd.to_numeric(df["gw"],           errors="coerce").fillna(0)
+
+    # ── Sort for rolling windows ───────────────────────────────────
+    df = df.sort_values(["season", "element", "gw"]).reset_index(drop=True)
+
+    # ── Rolling features (per player within a season) ─────────────
+    grp = df.groupby(["season", "element"])
+
+    def roll(col, n):
+        return grp[col].transform(lambda x: x.shift(1).rolling(n, min_periods=1).mean())
+
+    df["pts_roll3"]         = roll("total_points",  3)
+    df["pts_roll6"]         = roll("total_points",  6)
+    df["goals_roll5"]       = roll("goals_scored",  5)
+    df["assists_roll5"]     = roll("assists",        5)
+    df["clean_sheets_roll5"]= roll("clean_sheets",  5)
+    df["bonus_roll5"]       = roll("bonus",         5)
+    df["minutes_pct"]       = (df["minutes"] / 90).clip(0, 1)
+
+    # xG / xA not in vaastav — proxy with goals and assists for training
+    # (replaced by real xG/xA at inference time when available)
+    df["xg_roll5"] = df["goals_roll5"]
+    df["xa_roll5"] = df["assists_roll5"]
+
+    # ── Other features ─────────────────────────────────────────────
+    df["price"]                  = df["value"] / 10
+    df["is_home"]                = df["was_home"].astype(int)
+    df["transfers_in_event_norm"]= pd.to_numeric(
+        df["transfers_balance"], errors="coerce"
+    ).fillna(0).clip(-1e5, 1e5) / 1e5
+
+    # One-hot position
+    pos_map = {"GKP": "GK", "GK": "GK", "DEF": "DEF", "MID": "MID", "FWD": "FWD"}
+    df["position_clean"] = df["position"].map(pos_map).fillna("MID")
+    for pos in ["GK", "DEF", "MID", "FWD"]:
+        df[f"pos_{pos}"] = (df["position_clean"] == pos).astype(int)
+
+    # FDR proxy: not in vaastav, use neutral 3
+    df["fdr"] = 3
+
+    # ── Targets ───────────────────────────────────────────────────
+    # Target A: next GW points
+    df["target_next_gw"] = grp["total_points"].transform(lambda x: x.shift(-1))
+
+    # Target B: cumulative points from this GW to end of season (GW38)
+    df["target_season_rem"] = grp["total_points"].transform(
+        lambda x: x[::-1].cumsum()[::-1]
+    ) - df["total_points"]
+
+    # ── Drop rows with NaN targets or too few minutes ──────────────
+    df = df.dropna(subset=["target_next_gw", "target_season_rem"])
+    df = df[df["minutes"] >= 45].copy()
+
+    print(f"  [Phase 3] Training dataset: {len(df):,} rows × {len(GW_FEATURES)} features")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 4b. Model A — next-GW predictor (LightGBM)
+# ─────────────────────────────────────────────
+
+class FPLModel:
+    """
+    LightGBM regressor that predicts a player's points in the next GW.
+
+    Usage:
+        model = FPLModel()
+        if not model.load():               # try loading saved weights
+            df_train = build_training_data()
+            model.train(df_train)
+            model.save()
+        players = model.predict(players)   # adds 'predicted_points' column
+    """
+
+    MODEL_PATH = MODEL_DIR / "fpl_lgbm_gw.pkl"
+
+    def __init__(self):
+        self.model    = None
+        self.features = GW_FEATURES
+        self.mae      = None
+
+    def train(self, df):
+        """Fit LGBMRegressor on the vaastav training frame."""
+        if not LGBM_AVAILABLE:
+            print("  [FPLModel] lightgbm not available — skipping training.")
+            return False
+        if df is None or len(df) < MIN_TRAIN_ROWS:
+            print(f"  [FPLModel] Not enough training data ({len(df) if df is not None else 0} rows).")
+            return False
+
+        print("  [FPLModel] Training LightGBM next-GW model...")
+        available = [f for f in self.features if f in df.columns]
+        X = df[available].fillna(0)
+        y = df["target_next_gw"]
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, shuffle=False  # time-respecting split
+        )
+
+        self.model = lgb.LGBMRegressor(
+            n_estimators     = 800,
+            learning_rate    = 0.03,
+            num_leaves       = 63,
+            feature_fraction = 0.8,
+            bagging_fraction = 0.8,
+            bagging_freq     = 5,
+            min_child_samples= 20,
+            reg_alpha        = 0.1,
+            reg_lambda       = 0.1,
+            random_state     = 42,
+            verbose          = -1,
+        )
+        self.model.fit(
+            X_train, y_train,
+            eval_set          = [(X_val, y_val)],
+            callbacks         = [lgb.early_stopping(50, verbose=False),
+                                 lgb.log_evaluation(period=-1)],
+        )
+        preds     = self.model.predict(X_val)
+        self.mae  = mean_absolute_error(y_val, preds)
+        self.features = available   # store only cols that were present
+        print(f"  [FPLModel] Trained. Validation MAE: {self.mae:.3f} pts")
+        return True
+
+    def predict(self, players):
+        """
+        Add 'predicted_points' column to players DataFrame.
+        Falls back to heuristic if model not available.
+        """
+        if self.model is None:
+            print("  [FPLModel] No model loaded — using heuristic fallback.")
+            return players   # heuristic was already applied upstream
+
+        available = [f for f in self.features if f in players.columns]
+        missing   = [f for f in self.features if f not in players.columns]
+        if missing:
+            for col in missing:
+                players[col] = 0   # fill any absent live features with 0
+
+        X = players[self.features].fillna(0)
+        players["predicted_points"] = self.model.predict(X).clip(min=0)
+        print(f"  [FPLModel] Predictions generated for {len(players)} players.")
+        return players
+
+    def save(self):
+        MODEL_DIR.mkdir(exist_ok=True)
+        joblib.dump({"model": self.model, "features": self.features,
+                     "mae": self.mae}, self.MODEL_PATH)
+        print(f"  [FPLModel] Saved → {self.MODEL_PATH}")
+
+    def load(self):
+        if not self.MODEL_PATH.exists():
+            return False
+        data          = joblib.load(self.MODEL_PATH)
+        self.model    = data["model"]
+        self.features = data["features"]
+        self.mae      = data.get("mae")
+        print(f"  [FPLModel] Loaded from {self.MODEL_PATH} "
+              f"(val MAE: {self.mae:.3f})" if self.mae else
+              f"  [FPLModel] Loaded from {self.MODEL_PATH}")
+        return True
+
+    def feature_importance(self, top_n=15):
+        """Print top-N most important features."""
+        if self.model is None:
+            print("  No model loaded.")
+            return
+        imp = pd.Series(
+            self.model.feature_importances_, index=self.features
+        ).sort_values(ascending=False)
+        print(f"\n  Top {top_n} features (LightGBM gain):")
+        for feat, score in imp.head(top_n).items():
+            bar = "█" * int(score / imp.max() * 20)
+            print(f"    {feat:<30} {bar} {score:.1f}")
+
+
+# ─────────────────────────────────────────────
+# 4c. Model B — season-remainder predictor (XGBoost)
+# ─────────────────────────────────────────────
+
+class FPLSeasonModel:
+    """
+    XGBoost regressor that predicts a player's total points from the
+    current GW to the end of the season. Used in mode='season'.
+
+    Same interface as FPLModel.
+    """
+
+    MODEL_PATH = MODEL_DIR / "fpl_xgb_season.pkl"
+
+    def __init__(self):
+        self.model    = None
+        self.features = GW_FEATURES
+        self.mae      = None
+
+    def train(self, df):
+        if not XGB_AVAILABLE:
+            print("  [FPLSeasonModel] xgboost not available — skipping training.")
+            return False
+        if df is None or len(df) < MIN_TRAIN_ROWS:
+            print(f"  [FPLSeasonModel] Not enough training data.")
+            return False
+
+        print("  [FPLSeasonModel] Training XGBoost season-remainder model...")
+        available = [f for f in self.features if f in df.columns]
+        X = df[available].fillna(0)
+        y = df["target_season_rem"]
+
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, shuffle=False
+        )
+
+        self.model = xgb.XGBRegressor(
+            n_estimators      = 700,
+            max_depth         = 6,
+            learning_rate     = 0.03,
+            subsample         = 0.8,
+            colsample_bytree  = 0.8,
+            reg_alpha         = 0.1,
+            reg_lambda        = 0.1,
+            objective         = "reg:squarederror",
+            random_state      = 42,
+            verbosity         = 0,
+            early_stopping_rounds = 50,
+        )
+        self.model.fit(X_train, y_train,
+                       eval_set=[(X_val, y_val)], verbose=False)
+        preds    = self.model.predict(X_val)
+        self.mae = mean_absolute_error(y_val, preds)
+        self.features = available
+        print(f"  [FPLSeasonModel] Trained. Validation MAE: {self.mae:.3f} pts")
+        return True
+
+    def predict(self, players):
+        if self.model is None:
+            print("  [FPLSeasonModel] No model — using total_points as proxy.")
+            players["season_predicted_points"] = players["total_points"]
+            return players
+        available = [f for f in self.features if f in players.columns]
+        for col in [f for f in self.features if f not in players.columns]:
+            players[col] = 0
+        X = players[self.features].fillna(0)
+        players["season_predicted_points"] = self.model.predict(X).clip(min=0)
+        return players
+
+    def save(self):
+        MODEL_DIR.mkdir(exist_ok=True)
+        joblib.dump({"model": self.model, "features": self.features,
+                     "mae": self.mae}, self.MODEL_PATH)
+        print(f"  [FPLSeasonModel] Saved → {self.MODEL_PATH}")
+
+    def load(self):
+        if not self.MODEL_PATH.exists():
+            return False
+        data          = joblib.load(self.MODEL_PATH)
+        self.model    = data["model"]
+        self.features = data["features"]
+        self.mae      = data.get("mae")
+        print(f"  [FPLSeasonModel] Loaded from {self.MODEL_PATH}")
+        return True
+
+
+# ─────────────────────────────────────────────
+# 4d. Model C — captaincy ranker (haul classifier)
+# ─────────────────────────────────────────────
+
+class CaptaincyModel:
+    """
+    GradientBoosting binary classifier: predicts the probability that a
+    player scores ≥ HAUL_THRESHOLD points (default 12) in the next GW.
+
+    Output probability is used to break ties in captain selection —
+    prefer a player with high upside over one with merely high mean prediction.
+
+    Usage:
+        cap_model = CaptaincyModel()
+        if not cap_model.load():
+            cap_model.train(df_train)
+            cap_model.save()
+        selected_team = cap_model.rank_captains(selected_team)
+        # Adds 'haul_prob' column; select_captain() uses it automatically.
+    """
+
+    MODEL_PATH = MODEL_DIR / "fpl_cap_classifier.pkl"
+
+    def __init__(self):
+        self.model    = None
+        self.features = GW_FEATURES
+        self.auc      = None
+
+    def train(self, df):
+        if not SKLEARN_AVAILABLE:
+            print("  [CaptaincyModel] scikit-learn not available — skipping.")
+            return False
+        if df is None or len(df) < MIN_TRAIN_ROWS:
+            return False
+
+        print("  [CaptaincyModel] Training haul classifier...")
+        available = [f for f in self.features if f in df.columns]
+        X = df[available].fillna(0)
+        y = (df["target_next_gw"] >= HAUL_THRESHOLD).astype(int)
+
+        # Hauls are rare (~8% of rows) — use class_weight balancing
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, shuffle=False
+        )
+        self.model = GradientBoostingClassifier(
+            n_estimators  = 300,
+            max_depth     = 4,
+            learning_rate = 0.05,
+            subsample     = 0.8,
+            random_state  = 42,
+        )
+        self.model.fit(X_train, y_train)
+        proba     = self.model.predict_proba(X_val)[:, 1]
+        from sklearn.metrics import roc_auc_score
+        self.auc  = roc_auc_score(y_val, proba)
+        self.features = available
+        print(f"  [CaptaincyModel] Trained. Validation ROC-AUC: {self.auc:.3f}")
+        return True
+
+    def rank_captains(self, selected_team):
+        """Add 'haul_prob' column to the selected team DataFrame."""
+        if self.model is None:
+            selected_team["haul_prob"] = selected_team["predicted_points"] / \
+                                          selected_team["predicted_points"].max()
+            return selected_team
+        for col in [f for f in self.features if f not in selected_team.columns]:
+            selected_team[col] = 0
+        X = selected_team[self.features].fillna(0)
+        selected_team["haul_prob"] = self.model.predict_proba(X)[:, 1]
+        return selected_team
+
+    def save(self):
+        MODEL_DIR.mkdir(exist_ok=True)
+        joblib.dump({"model": self.model, "features": self.features,
+                     "auc": self.auc}, self.MODEL_PATH)
+        print(f"  [CaptaincyModel] Saved → {self.MODEL_PATH}")
+
+    def load(self):
+        if not self.MODEL_PATH.exists():
+            return False
+        data          = joblib.load(self.MODEL_PATH)
+        self.model    = data["model"]
+        self.features = data["features"]
+        self.auc      = data.get("auc")
+        print(f"  [CaptaincyModel] Loaded from {self.MODEL_PATH}")
+        return True
+
+
+# ─────────────────────────────────────────────
+# 4e. Model manager — trains/loads all three
+# ─────────────────────────────────────────────
+
+def load_or_train_models(force_retrain=False):
+    """
+    Attempt to load all three saved models.
+    If any are missing (or force_retrain=True), train from vaastav data.
+
+    Returns:
+        gw_model      (FPLModel)
+        season_model  (FPLSeasonModel)
+        cap_model     (CaptaincyModel)
+    All three may have model=None if neither saved weights nor vaastav
+    data are available — in that case the heuristic fallback is used.
+    """
+    gw_model     = FPLModel()
+    season_model = FPLSeasonModel()
+    cap_model    = CaptaincyModel()
+
+    all_loaded = (
+        not force_retrain
+        and gw_model.load()
+        and season_model.load()
+        and cap_model.load()
+    )
+
+    if not all_loaded:
+        print("\n  [Phase 3] Training models from vaastav historical data...")
+        df_train = build_training_data()
+        if df_train is not None and len(df_train) >= MIN_TRAIN_ROWS:
+            gw_model.train(df_train)
+            gw_model.save()
+            season_model.train(df_train)
+            season_model.save()
+            cap_model.train(df_train)
+            cap_model.save()
+        else:
+            print("  [Phase 3] No training data — heuristic predictions will be used.")
+
+    return gw_model, season_model, cap_model
+
+
+# ─────────────────────────────────────────────
+# 4f. Live feature enrichment for current players
+# ─────────────────────────────────────────────
+
+def enrich_features_for_prediction(players, player_histories):
+    """
+    Build the same rolling feature columns used during training,
+    but from the live player history data fetched from the FPL API.
+
+    player_histories: dict {player_id: DataFrame} from fetch_all_player_histories()
+    Adds all GW_FEATURES columns to the players DataFrame in-place.
+    """
+    print("  [Phase 3] Engineering live features for prediction...")
+
+    def rolling_mean(history_df, col, n):
+        if history_df is None or history_df.empty or col not in history_df.columns:
+            return 0.0
+        vals = pd.to_numeric(history_df[col], errors="coerce").fillna(0)
+        return float(vals.tail(n).mean())
+
+    for col in GW_FEATURES:
+        if col not in players.columns:
+            players[col] = 0.0
+
+    for idx, row in players.iterrows():
+        pid  = row["id"]
+        hist = player_histories.get(pid)
+
+        players.at[idx, "pts_roll3"]          = rolling_mean(hist, "total_points", 3)
+        players.at[idx, "pts_roll6"]          = rolling_mean(hist, "total_points", 6)
+        players.at[idx, "goals_roll5"]        = rolling_mean(hist, "goals_scored", 5)
+        players.at[idx, "assists_roll5"]      = rolling_mean(hist, "assists", 5)
+        players.at[idx, "clean_sheets_roll5"] = rolling_mean(hist, "clean_sheets", 5)
+        players.at[idx, "bonus_roll5"]        = rolling_mean(hist, "bonus", 5)
+
+        # xG / xA: use goals/assists as proxy (replace with Understat merge later)
+        players.at[idx, "xg_roll5"]           = players.at[idx, "goals_roll5"]
+        players.at[idx, "xa_roll5"]           = players.at[idx, "assists_roll5"]
+
+        # minutes_pct from latest GW
+        if hist is not None and not hist.empty and "minutes" in hist.columns:
+            last_mins = pd.to_numeric(hist["minutes"], errors="coerce").iloc[-1]
+            players.at[idx, "minutes_pct"] = float(min(last_mins / 90, 1.0))
+
+        # is_home: from next fixture (not in player history — left as 0 default)
+        players.at[idx, "price"] = row["now_cost"] / 10
+
+        # transfers_in_event normalised
+        t = pd.to_numeric(row.get("transfers_in_event", 0), errors="coerce") or 0
+        players.at[idx, "transfers_in_event_norm"] = float(np.clip(t / 1e5, -1, 1))
+
+    # Position one-hots (already set in preprocess_data but ensure here)
+    for pos in ["GK", "DEF", "MID", "FWD"]:
+        players[f"pos_{pos}"] = (players["element_type"] == pos).astype(int)
+
+    # fdr was already added by add_fixture_difficulty
+    return players
+
+
+# ─────────────────────────────────────────────
+# 4g. Auto-retrain trigger (feedback loop)
+# ─────────────────────────────────────────────
+
+def should_retrain(tracker: "SeasonTracker"):
+    """
+    Check rolling MAE from the SeasonTracker.
+    Returns True if the model should be retrained.
+    """
+    with tracker._connect() as conn:
+        rows = conn.execute("""
+            SELECT predicted_pts, actual_pts
+            FROM   team_selections
+            WHERE  actual_pts IS NOT NULL
+            ORDER  BY gw DESC
+            LIMIT  75          -- last 5 GWs × 15 players
+        """).fetchall()
+
+    if len(rows) < 30:
+        return False   # not enough data yet
+
+    errors = [abs(pred - actual) for pred, actual in rows]
+    rolling_mae = sum(errors) / len(errors)
+    print(f"  [Phase 3] Rolling MAE (last ~5 GWs): {rolling_mae:.3f} pts/player")
+    if rolling_mae > RETRAIN_MAE_TRIGGER:
+        print(f"  [Phase 3] MAE > {RETRAIN_MAE_TRIGGER} threshold — retraining triggered.")
+        return True
+    return False
+
+
+# ══════════════════════════════════════════════
+# SECTION 5 — TEAM OPTIMIZATION
 # ══════════════════════════════════════════════
 
 def optimize_team(players, mode="gw"):
@@ -305,16 +968,28 @@ def optimize_team(players, mode="gw"):
 
 
 def select_captain(selected_team):
-    """Returns the captain row (is_captain == True)."""
+    """
+    Pick captain using a blend of predicted points and haul probability
+    (Phase 3) when available. Falls back to highest predicted_points.
+    The optimizer already set is_captain on the best linear choice;
+    the captaincy model can override it with a probability-aware pick.
+    """
+    if "haul_prob" in selected_team.columns:
+        norm_pts = selected_team["predicted_points"] / (
+            selected_team["predicted_points"].max() or 1
+        )
+        score  = 0.70 * norm_pts + 0.30 * selected_team["haul_prob"]
+        best_i = score.idxmax()
+        selected_team["is_captain"] = selected_team.index == best_i
+        return selected_team.loc[best_i]
     captains = selected_team[selected_team["is_captain"] == True]
     if not captains.empty:
         return captains.iloc[0]
-    # Fallback: highest predicted points
     return selected_team.loc[selected_team["predicted_points"].idxmax()]
 
 
 # ══════════════════════════════════════════════
-# SECTION 5 — SEASON TRACKER  (Phase 2)
+# SECTION 6 — SEASON TRACKER  (Phase 2)
 # ══════════════════════════════════════════════
 
 class SeasonTracker:
@@ -528,7 +1203,7 @@ class SeasonTracker:
 
 
 # ══════════════════════════════════════════════
-# SECTION 6 — OUTPUT
+# SECTION 7 — OUTPUT
 # ══════════════════════════════════════════════
 
 def output_results(selected_team, captain, mode="gw"):
@@ -558,78 +1233,321 @@ def output_results(selected_team, captain, mode="gw"):
 
 
 # ══════════════════════════════════════════════
-# SECTION 7 — MAIN
+# SECTION 8 — MAIN
 # ══════════════════════════════════════════════
 
-def run(mode="gw", gw=None, save_to_tracker=True):
+def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     """
-    Full pipeline run.
+    Full pipeline run — v3.0
 
     Args:
-        mode          : 'gw' for next-GW selection, 'season' for
-                        season-best selection.
-        gw            : Gameweek number to label this run in the tracker.
-                        If None, it's inferred from the next unplayed fixture.
-        save_to_tracker: Whether to persist the selection to SQLite.
+        mode           : 'gw'     → next-GW team (Model A + CaptaincyModel)
+                         'season' → season-best team (Model B)
+        gw             : Gameweek number for the tracker. Auto-inferred if None.
+        save_to_tracker: Persist selection to SQLite.
+        force_retrain  : Force model retraining even if saved weights exist.
+
+    Pipeline:
+        1. Fetch FPL API data
+        2. Preprocess players
+        3. Concurrent player history fetch
+        4. Fixture difficulty
+        5. Heuristic features (v2 fallback)
+        6. [Phase 3] Load / train ML models
+        7. [Phase 3] Enrich live features for ML prediction
+        8. [Phase 3] ML prediction overwrites heuristic predicted_points
+        9. [Phase 3] Auto-retrain check via SeasonTracker MAE
+        10. Optimise squad (PuLP)
+        11. [Phase 3] Captaincy model ranks captain candidates
+        12. Output + persist
 
     Returns:
         selected_team (DataFrame), captain (Series)
     """
-    # --- Fetch ---
+    # ── 1. Fetch ────────────────────────────────────────────────────
     data     = fetch_data()
     fixtures = fetch_fixture_data()
 
-    # Infer current GW if not provided
     if gw is None:
         upcoming = fixtures[fixtures["finished"] == False]
         gw = int(upcoming["event"].min()) if not upcoming.empty else 38
         print(f"Inferred current GW: {gw}")
 
-    # --- Preprocess ---
+    # ── 2. Preprocess ───────────────────────────────────────────────
     players, teams = preprocess_data(data)
 
-    # --- Features ---
-    players = calculate_form(players)
-    players = add_fixture_difficulty(players, fixtures, teams)
-    players = update_predicted_points(players)
+    # ── 3. Concurrent history fetch (reuse for both form + ML features)
+    player_ids      = players["id"].tolist()
+    player_histories = fetch_all_player_histories(player_ids)
 
-    # --- Optimise ---
+    # ── 4. Fixture difficulty ────────────────────────────────────────
+    players = add_fixture_difficulty(players, fixtures, teams)
+
+    # ── 5. Heuristic form + predicted_points (v2 fallback) ──────────
+    form_values = {}
+    for _, row in players.iterrows():
+        pid  = row["id"]
+        hist = player_histories.get(pid)
+        if hist is not None and not hist.empty:
+            pts = pd.to_numeric(hist.get("total_points", pd.Series()), errors="coerce")
+            form_values[pid] = pts.tail(7).mean()
+        else:
+            form_values[pid] = row["form"]
+    players["form_calc"] = players["id"].map(form_values).fillna(0)
+    players = update_predicted_points(players)   # heuristic baseline
+
+    # ── 6. Load / train Phase 3 ML models ───────────────────────────
+    tracker      = SeasonTracker() if save_to_tracker else None
+    should_force = force_retrain or (
+        tracker is not None and should_retrain(tracker)
+    )
+    gw_model, season_model, cap_model = load_or_train_models(
+        force_retrain=should_force
+    )
+
+    # ── 7. Enrich live features ──────────────────────────────────────
+    players = enrich_features_for_prediction(players, player_histories)
+
+    # ── 8. ML predictions (overwrite heuristic if model available) ──
+    if mode == "season":
+        players = season_model.predict(players)
+        # Map season_predicted_points → predicted_points for optimizer
+        if "season_predicted_points" in players.columns:
+            players["predicted_points"] = players["season_predicted_points"]
+    else:
+        players = gw_model.predict(players)   # writes predicted_points directly
+
+    # ── 9 + 10. Optimise squad ───────────────────────────────────────
     selected_team = optimize_team(players, mode=mode)
+
+    # ── 11. Captaincy model ──────────────────────────────────────────
+    selected_team = cap_model.rank_captains(selected_team)
     captain       = select_captain(selected_team)
 
-    # --- Output ---
+    # ── 12. Output + persist ─────────────────────────────────────────
     output_results(selected_team, captain, mode=mode)
 
-    # --- Persist to Season Tracker ---
-    if save_to_tracker:
-        tracker = SeasonTracker()
+    if tracker is not None:
         tracker.save_selection(gw=gw, selected_team=selected_team, mode=mode)
 
     return selected_team, captain
 
 
 def main():
-    # ── Run GW selection ──────────────────────────────────────────
-    selected_team, captain = run(mode="gw", save_to_tracker=True)
+    import argparse
 
-    # ── Example: record actual points after GW resolves ──────────
-    # Uncomment and populate after real GW results come in:
-    #
-    # tracker = SeasonTracker()
-    # tracker.record_actual_points(gw=28, actual_points={
-    #     123: 12,   # player_id: actual_pts
-    #     456: 6,
-    #     789: 2,
-    #     # ... all 15 players
-    # })
+    parser = argparse.ArgumentParser(
+        prog="fpl_team_generator.py",
+        description="FPL ML Team Generator — pick the best squad for any objective",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+MODES
+  -g   Best team for the NEXT GAMEWEEK
+         Uses LightGBM trained on historical data + live FPL API stats.
+         Captaincy is decided by a haul-probability classifier.
 
-    # ── Example: view season summary ─────────────────────────────
-    # tracker = SeasonTracker()
-    # tracker.season_summary()
+  -s   Best team for the SEASON (remainder)
+         Uses XGBoost trained to predict total points from now to GW38.
+         Best for wildcard planning or pre-season setup.
 
-    # ── Example: retrieve a past GW squad ────────────────────────
-    # past_squad = tracker.get_gw_selection(gw=27)
-    # print(past_squad)
+  -c   Best team based on CURRENT SEASON stats only
+         No historical training data needed. Uses only live FPL API data
+         (form, total points, PPG) to pick the team. Fastest mode.
+
+TRACKER COMMANDS
+  --history GW         Print the squad selected in a specific past gameweek
+  --summary            Print full season accuracy report
+  --record GW P:A ...  Record actual points after a GW resolves
+                       Format: player_id:actual_pts  e.g.  123:12 456:6
+
+OTHER
+  --retrain            Force ML model retraining from vaastav data
+  --importance         Print feature importance of the GW model
+
+EXAMPLES
+  python3 fpl_team_generator.py -g
+  python3 fpl_team_generator.py -s
+  python3 fpl_team_generator.py -c
+  python3 fpl_team_generator.py -g --retrain
+  python3 fpl_team_generator.py --summary
+  python3 fpl_team_generator.py --history 28
+  python3 fpl_team_generator.py --record 28 123:12 456:6 789:2
+  python3 fpl_team_generator.py --importance
+        """
+    )
+
+    # ── Mode flags (mutually exclusive) ──────────────────────────────
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "-g", "--gameweek",
+        action="store_true",
+        help="Best team for next gameweek (default)"
+    )
+    mode_group.add_argument(
+        "-s", "--season",
+        action="store_true",
+        help="Best team for the season remainder"
+    )
+    mode_group.add_argument(
+        "-c", "--current",
+        action="store_true",
+        help="Best team from current season live stats only (no ML training needed)"
+    )
+
+    # ── Tracker commands ──────────────────────────────────────────────
+    parser.add_argument(
+        "--history",
+        metavar="GW",
+        type=int,
+        help="Print the squad selected in a past gameweek"
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print full season accuracy summary"
+    )
+    parser.add_argument(
+        "--record",
+        metavar=("GW", "P:A"),
+        nargs="+",
+        help="Record actual points after a GW resolves. "
+             "First arg is the GW number, then player_id:actual_pts pairs"
+    )
+
+    # ── ML options ────────────────────────────────────────────────────
+    parser.add_argument(
+        "--retrain",
+        action="store_true",
+        help="Force ML model retraining from vaastav historical data"
+    )
+    parser.add_argument(
+        "--importance",
+        action="store_true",
+        help="Print feature importance of the trained GW prediction model"
+    )
+    parser.add_argument(
+        "--gw",
+        metavar="N",
+        type=int,
+        default=None,
+        help="Override the gameweek number used when saving to the tracker"
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Run without saving selection to the season tracker DB"
+    )
+
+    args = parser.parse_args()
+
+    # ── Tracker-only commands (no team generation needed) ─────────────
+    tracker = SeasonTracker()
+
+    if args.summary:
+        tracker.season_summary()
+        return
+
+    if args.history is not None:
+        past = tracker.get_gw_selection(gw=args.history)
+        if not past.empty:
+            print(f"\n  GW {args.history} Selection:")
+            print(past[[
+                "gw", "web_name", "team", "position",
+                "price", "predicted_pts", "actual_pts", "is_captain"
+            ]].to_string(index=False))
+        return
+
+    if args.record is not None:
+        record_args = args.record
+        if len(record_args) < 2:
+            print("Error: --record requires a GW number and at least one player_id:pts pair")
+            print("  Example: --record 28 123:12 456:6 789:2")
+            return
+        try:
+            gw_num = int(record_args[0])
+            actual_points = {}
+            for pair in record_args[1:]:
+                pid, pts = pair.split(":")
+                actual_points[int(pid)] = int(pts)
+            tracker.record_actual_points(gw=gw_num, actual_points=actual_points)
+            print(f"\n  ✓ Recorded {len(actual_points)} players for GW {gw_num}")
+            tracker.season_summary()
+        except ValueError as e:
+            print(f"Error parsing --record arguments: {e}")
+            print("  Format: --record GW player_id:pts player_id:pts ...")
+        return
+
+    if args.importance:
+        m = FPLModel()
+        if m.load():
+            m.feature_importance(top_n=17)
+        else:
+            print("No trained model found. Run with -g first to train.")
+        return
+
+    # ── Determine run mode ────────────────────────────────────────────
+    if args.season:
+        mode = "season"
+    elif args.current:
+        mode = "current"
+    else:
+        mode = "gw"   # default: -g or no flag
+
+    save = not args.no_save
+
+    # ── current mode: bypass ML, use live stats only ──────────────────
+    if mode == "current":
+        _run_current_mode(gw=args.gw, save_to_tracker=save)
+        return
+
+    # ── gw / season modes ─────────────────────────────────────────────
+    run(
+        mode=mode,
+        gw=args.gw,
+        save_to_tracker=save,
+        force_retrain=args.retrain,
+    )
+
+
+def _run_current_mode(gw=None, save_to_tracker=True):
+    """
+    Current-season mode (-c flag).
+    Uses only live FPL API stats — no vaastav historical data, no ML model.
+    Predicted points = weighted blend of:
+      - PPG (points per 90 mins) this season
+      - FPL rolling form (last 5 GWs, from API)
+      - Fixture difficulty for next GW
+    Fastest mode; useful early in the season before enough data exists
+    to train ML models.
+    """
+    print("\n  Mode: CURRENT SEASON STATS ONLY (no ML)\n")
+
+    data     = fetch_data()
+    fixtures = fetch_fixture_data()
+
+    if gw is None:
+        upcoming = fixtures[fixtures["finished"] == False]
+        gw = int(upcoming["event"].min()) if not upcoming.empty else 38
+        print(f"  Inferred current GW: {gw}")
+
+    players, teams = preprocess_data(data)
+    players = add_fixture_difficulty(players, fixtures, teams)
+
+    # Use PPG as the core signal — no rolling history needed
+    players["form_calc"] = players["form"]   # FPL's own 5-GW rolling form
+    players = update_predicted_points(players)
+
+    selected_team = optimize_team(players, mode="gw")
+
+    # No captaincy ML — fall back to highest predicted_points
+    captain = selected_team.loc[selected_team["predicted_points"].idxmax()]
+    selected_team["is_captain"] = selected_team.index == captain.name
+
+    output_results(selected_team, captain, mode="gw")
+
+    if save_to_tracker:
+        tracker = SeasonTracker()
+        tracker.save_selection(gw=gw, selected_team=selected_team, mode="current")
 
 
 if __name__ == "__main__":

@@ -3,4 +3,19 @@
 
 # setup files
 fetch-fpl-data.py
+fpl_tracker.db
 update.py
+pd
+Pipfile
+pulp
+requests
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+fpl_env/
+
+#folders to ignore
+fpl_env/
+vaastav_data/
+models/
