@@ -233,8 +233,22 @@ def add_fixture_difficulty(players, fixtures, teams):
     FIX: Now correctly picks only the NEXT unplayed gameweek's fixture
     per team, not the last fixture in the full list.
     FIX: Adds null guard — blank GW teams get a neutral FDR of 3.
+    FIX:
+    Picks the next unplayed gameweek's fixture per team and maps both
+    FDR and home/away flag onto every player row.
+ 
+    Adds two columns to players:
+        fdr      — fixture difficulty rating (1=easy … 5=hard). Neutral=3
+                   for teams with a blank GW.
+        is_home  — 1 if the team plays at home next GW, 0 if away,
+                   0.5 for blank GW (neutral — treated as neither
+                   advantage nor disadvantage by the model).
+ 
+    Previously is_home was hardcoded to 0 for all players, which meant
+    the model never saw home advantage at inference time even though it
+    was trained on it. This fix closes that gap.
     """
-    print("Adding fixture difficulty for next GW...")
+    print("Adding fixture difficulty and home/away for next GW...")
 
     team_id_to_name = dict(zip(teams["id"], teams["name"]))
     fixtures = fixtures.copy()
@@ -246,6 +260,7 @@ def add_fixture_difficulty(players, fixtures, teams):
     if upcoming.empty:
         print("  Warning: No upcoming fixtures found. Using neutral FDR=3.")
         players["fdr"] = 3
+        players["is_home"] = 0.5
         return players
 
     next_gw    = upcoming["event"].min()
@@ -254,12 +269,25 @@ def add_fixture_difficulty(players, fixtures, teams):
 
     # Build one FDR entry per team for that GW
     fdr_dict = {}
+    is_home_dict = {}
     for _, fixture in next_fixes.iterrows():
-        fdr_dict[fixture["team_a"]] = fixture["team_h_difficulty"]
-        fdr_dict[fixture["team_h"]] = fixture["team_a_difficulty"]
+        team_a = fixture["team_a"] # away side
+        team_h = fixture["team_h"] # home side
+        fdr_dict[team_h] = fixture["team_h_difficulty"]
+        fdr_dict[team_a] = fixture["team_a_difficulty"]
+        is_home_dict[team_a] = 0 # team_a plays away
+        is_home_dict[team_h] = 1 # team_h plays at home
 
-    # FIX: fillna(3) handles blank GWs — neutral difficulty
+    # FIX: fillna handles blank GWs — neutral difficulty, neutral home value
     players["fdr"] = players["team"].map(fdr_dict).fillna(3)
+    players["is_home"] = players["team"].map(is_home_dict).fillna(0.5)
+
+    home_count = (players["is_home"] == 1).sum()
+    away_count = (players["is_home"] == 0).sum()
+    blank_count = (players["is_home"] == 0.5).sum()
+    print(f"  Home: {home_count} players | Away: {away_count} players "
+            f"| Blank GW: {blank_count} players")
+
     return players
 
 
@@ -825,6 +853,11 @@ def enrich_features_for_prediction(players, player_histories):
 
     player_histories: dict {player_id: DataFrame} from fetch_all_player_histories()
     Adds all GW_FEATURES columns to the players DataFrame in-place.
+
+    is_home is now read from the 'is_home' column added by
+    add_fixture_difficulty() rather than being hardcoded to 0.
+    Previously this meant the model never saw home advantage at
+    prediction time despite being trained on it.
     """
     print("  [Phase 3] Engineering live features for prediction...")
 
@@ -858,7 +891,10 @@ def enrich_features_for_prediction(players, player_histories):
             last_mins = pd.to_numeric(hist["minutes"], errors="coerce").iloc[-1]
             players.at[idx, "minutes_pct"] = float(min(last_mins / 90, 1.0))
 
-        # is_home: from next fixture (not in player history — left as 0 default)
+        # is_home: read from from fixture data populated by add_fixture_difficulty()
+        # Falls back to 0.5 (neutral) if column is missing for any reason
+        players.at[idx, "is_home"] = float(row.get("is_home", 0.5))
+
         players.at[idx, "price"] = row["now_cost"] / 10
 
         # transfers_in_event normalised
@@ -869,7 +905,7 @@ def enrich_features_for_prediction(players, player_histories):
     for pos in ["GK", "DEF", "MID", "FWD"]:
         players[f"pos_{pos}"] = (players["element_type"] == pos).astype(int)
 
-    # fdr was already added by add_fixture_difficulty
+    # fdr and is_home was already added by add_fixture_difficulty
     return players
 
 
