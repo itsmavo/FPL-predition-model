@@ -81,7 +81,11 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     warnings.warn("scikit-learn / joblib not installed. Run: pip install scikit-learn joblib")
 
-# Priority 2 - Understat xG/xA (optional, graceful fallback to proxy)
+# Priority 2 — Understat xG/xA via HTTP scraper (no aiohttp/understat lib needed)
+# Uses plain requests + regex to extract the JSON blob Understat embeds in
+# their league pages. Works on all Python versions including 3.12.
+import json
+import re
 UNDERSTAT_AVAILABLE = True # uses plain requests - no extra install needed
     
 try:
@@ -113,7 +117,7 @@ MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little da
 
 # Priority 2 - Understat config
 UNDERSTAT_SEASON = "2024" # year the current PL season started (e.g. "2024" for 2024-25)
-UNDERSTAT_USE_API = False # set True if understat lib works on the python Version
+
 UNDERSTAT_CACHE = Path("understat_cache.csv") # avoid re-fetching every run
 NAME_MATCH_THRESHOLD = 75 # rapidfuzz score (0-100); below this = no match
 
@@ -881,22 +885,23 @@ def load_or_train_models(force_retrain=False):
 
 def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
     """
-     Fetch per-player xG and xA for every match in the current Premier
-    League season from the Understat API.
+    Fetch per-player xG and xA for the current Premier League season
+    from Understat using a plain HTTP scrape — no aiohttp or understat
+    library required. Works on Python 3.12+.
+ 
+    Understat embeds player data as a JSON blob inside a <script> tag
+    on their league page. We extract it with a regex and parse it
+    directly, bypassing the broken aiohttp wheel build entirely.
  
     Returns a DataFrame with columns:
-        player_name, xg_per90, xa_per90, xg_roll5_raw, xa_roll5_raw
-    indexed by Understat player name (used for fuzzy matching to FPL names).
+        player_name, xg_per90, xa_per90, total_xg, total_xa,
+        minutes, fetched_at
  
-    Results are cached to UNDERSTAT_CACHE (CSV) to avoid re-fetching on
-    every run. Delete the cache file to force a fresh fetch.
+    Results are cached to UNDERSTAT_CACHE (CSV) for the rest of the
+    calendar day — delete the file to force a fresh fetch.
  
     Returns None on any failure — caller falls back to goals/assists proxy.
- 
-    Requires:  pip install understat
     """
-    if not UNDERSTAT_AVAILABLE:
-        return None
     
     # -- Return cached data if fresh enough (same calendar day) ---
     if cache_path.exists():
@@ -909,26 +914,29 @@ def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
         except Exception:
             pass # corrupt cache -- re-fetch
 
-    print(f" [Understat] Fetching xG/xA for {season} season...")
+    print(f" [Understat] Scraping xG/xA for {season} season...")
     try:
-        async def _fetch():
-            url = (f"https://understat.com/main/getPlayersStats/"
-           f"seasonId/{season}")
-            # Understat embeds JSON in a <script> tag — use their league endpoint instead
-            import json, re
             url = f"https://understat.com/league/EPL/{season}"
-            resp = requests.get(url, timeout=20,
-                                headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(url,timeout=20, 
+                                headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36")}
+                )
             resp.raise_for_status()
-            # Extract the JSON blob Understat embeds in a script tag
-            match = re.search(
-                r"var playersData\s*=\s*JSON\.parse\('(.+?)'\)", resp.text
-            )
+
+            # Understat embeds: var playersData = JSON.parse('...')
+            # The inner string is unicode-escaped JSON
+            match = re.search(r"var\s+playersData\s*=\s*JSON\.parse\('(.+?)'\)", 
+                              resp.text,
+                              re.DOTALL)
             if not match:
-                print(" [Understat] Could not parse player data from page.")
+                print(" [Understat] Could not find playersData in page."
+                      " Understat may have changed their page structure.")
                 return None
-            
-            raw = json.loads(match.group(1).encode().decode('unicode_escape'))
+
+            # Decode the unicode-escaped string then parse JSON
+            raw_json = match.group(1).encode("utf-8").decode("unicode_escape")
+            raw = json.loads(raw_json)
             rows = []
             for p in raw:
                 try:
@@ -958,9 +966,15 @@ def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
             df.to_csv(cache_path, index=False)
             print(f" [Understat] Fetched {len(df)} players. Cached -> {cache_path}")
             return df
-        
+    except requests.exceptions.Timeout:
+        print(" [Understat] Request timed out. Falling back to goals/assists proxy.")
+        return None
+    except requests.exceptions.HTTPError as e:
+        print(f" [Understat] HTTP error: {e}. Falling back to goals/assists proxy.")
+        return None
+      
     except Exception as e:
-        print(f" [Understat] Fetch failed: {e}. Falling back to goals/assists proxy.")
+        print(f" [Understat] Scrape failed: {e}. Falling back to goals/assists proxy.")
         return None
 
 def merge_understat(players, understat_df):
