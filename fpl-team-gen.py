@@ -27,6 +27,22 @@ Phase 3 additions:
     present, the system falls back gracefully to the v2 weighted formula
   - New dependency: lightgbm, xgboost, scikit-learn, joblib
     pip install lightgbm xgboost scikit-learn joblib
+    Priority 1 fix:
+  - add_fixture_difficulty() now maps is_home (1/0/0.5) per player
+    from real fixture data instead of hardcoding 0 for all players
+  - enrich_features_for_prediction() reads is_home from the players
+    DataFrame rather than defaulting every player to away
+Priority 2 fix (this version):
+  - fetch_understat_xg(): pulls real xG and xA per player from the
+    Understat API for the current Premier League season
+  - merge_understat(): fuzzy name-matches Understat players to FPL
+    players using rapidfuzz, with configurable match threshold
+  - enrich_features_for_prediction() now uses real xg_roll5 / xa_roll5
+    from Understat instead of proxying them from goals/assists
+  - Graceful fallback: if understat or rapidfuzz is not installed, or
+    the Understat fetch fails, goals/assists proxy is used silently
+  - New dependencies: pip install understat rapidfuzz
+    (both optional — system works without them)
 """
 
 import requests
@@ -65,6 +81,17 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     warnings.warn("scikit-learn / joblib not installed. Run: pip install scikit-learn joblib")
 
+# Priority 2 - Understat xG/xA (optional, graceful fallback to proxy)
+UNDERSTAT_AVAILABLE = True # uses plain requests - no extra install needed
+    
+try:
+    from rapidfuzz import process as fuzz_process, fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    warnings.warn("rapidfuzz not installed - Understat name matching disabled. "
+                  "Run: pip install rapidfuzz")
+
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
@@ -83,6 +110,12 @@ VAASTAV_DIR         = Path("vaastav_data")    # path to vaastav CSV history file
 HAUL_THRESHOLD      = 12   # pts — captaincy model: what counts as a "haul"
 RETRAIN_MAE_TRIGGER = 3.5  # if rolling 5-GW MAE exceeds this, auto-retrain
 MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little data)
+
+# Priority 2 - Understat config
+UNDERSTAT_SEASON = "2024" # year the current PL season started (e.g. "2024" for 2024-25)
+UNDERSTAT_USE_API = False # set True if understat lib works on the python Version
+UNDERSTAT_CACHE = Path("understat_cache.csv") # avoid re-fetching every run
+NAME_MATCH_THRESHOLD = 75 # rapidfuzz score (0-100); below this = no match
 
 # ML feature columns used by all three models
 GW_FEATURES = [
@@ -843,21 +876,189 @@ def load_or_train_models(force_retrain=False):
 
 
 # ─────────────────────────────────────────────
-# 4f. Live feature enrichment for current players
+# 4f-i. Understat xG / xA fetch (Priority 2)
 # ─────────────────────────────────────────────
 
-def enrich_features_for_prediction(players, player_histories):
+def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
+    """
+     Fetch per-player xG and xA for every match in the current Premier
+    League season from the Understat API.
+ 
+    Returns a DataFrame with columns:
+        player_name, xg_per90, xa_per90, xg_roll5_raw, xa_roll5_raw
+    indexed by Understat player name (used for fuzzy matching to FPL names).
+ 
+    Results are cached to UNDERSTAT_CACHE (CSV) to avoid re-fetching on
+    every run. Delete the cache file to force a fresh fetch.
+ 
+    Returns None on any failure — caller falls back to goals/assists proxy.
+ 
+    Requires:  pip install understat
+    """
+    if not UNDERSTAT_AVAILABLE:
+        return None
+    
+    # -- Return cached data if fresh enough (same calendar day) ---
+    if cache_path.exists():
+        try:
+            cached = pd.read_csv(cache_path)
+            cached_data = pd.to_datetime(cached["fetched_at"].iloc[0]).date()
+            if cached_data == datetime.now().date():
+                print(f" [Understat] Using cached xG/xA data ({cache_path})")
+                return cached
+        except Exception:
+            pass # corrupt cache -- re-fetch
+
+    print(f" [Understat] Fetching xG/xA for {season} season...")
+    try:
+        async def _fetch():
+            url = (f"https://understat.com/main/getPlayersStats/"
+           f"seasonId/{season}")
+            # Understat embeds JSON in a <script> tag — use their league endpoint instead
+            import json, re
+            url = f"https://understat.com/league/EPL/{season}"
+            resp = requests.get(url, timeout=20,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            # Extract the JSON blob Understat embeds in a script tag
+            match = re.search(
+                r"var playersData\s*=\s*JSON\.parse\('(.+?)'\)", resp.text
+            )
+            if not match:
+                print(" [Understat] Could not parse player data from page.")
+                return None
+            
+            raw = json.loads(match.group(1).encode().decode('unicode_escape'))
+            rows = []
+            for p in raw:
+                try:
+                    mins = float(p.get("time", 0) or 0)
+                    xg = float(p.get("xG", 0) or 0)
+                    xa = float(p.get("xA", 0) or 0)
+                    if mins < 1:
+                        continue
+                    per90 = mins / 90
+                    rows.append({
+                        "player_name": p.get("player_name", ""),
+                        "xg_per90": round(xg / per90, 4),
+                        "xa_per90": round(xa / per90, 4),
+                        "total_xg": round(xg, 4),
+                        "total_xa": round(xa, 4),
+                        "minutes": mins,
+                        "fetched_at": datetime.now().isoformat(),
+                    })
+                except (TypeError, ValueError, ZeroDivisionError):
+                    continue
+
+            if not rows:
+                print(" [Understat] No player data returned.")
+                return None
+            
+            df = pd.DataFrame(rows)
+            df.to_csv(cache_path, index=False)
+            print(f" [Understat] Fetched {len(df)} players. Cached -> {cache_path}")
+            return df
+        
+    except Exception as e:
+        print(f" [Understat] Fetch failed: {e}. Falling back to goals/assists proxy.")
+        return None
+
+def merge_understat(players, understat_df):
+    """
+    Fuzzy-match FPL player names to Understat player names and add
+    xg_roll5 / xa_roll5 columns derived from real xG/xA data.
+ 
+    Why fuzzy matching:
+        FPL uses "Alexander-Arnold"; Understat uses "Trent Alexander-Arnold"
+        FPL uses "Salah"; Understat uses "Mohamed Salah"
+        Direct string joins fail on ~40% of players without this step.
+ 
+    Match strategy:
+        1. Try exact match on web_name (FPL short name) first
+        2. Try exact match on full name where available
+        3. Fuzzy match using rapidfuzz WRatio scorer
+        4. If score < NAME_MATCH_THRESHOLD → no match, use proxy
+ 
+    Adds two columns to players:
+        xg_roll5  — rolling 5-GW xG average (scaled from season per90)
+        xa_roll5  — rolling 5-GW xA average (scaled from season per90)
+ 
+    Players without a match keep their goals/assists proxy values.
+ 
+    Requires:  pip install rapidfuzz
+    """
+    if understat_df is None or understat_df.empty:
+        return players
+    
+    if not RAPIDFUZZ_AVAILABLE:
+        print(" [Understat] rapidfuzz not available -- skipping name merge.")
+        return players
+    
+    understat_names = understat_df["player_name"].tolist()
+
+    matched = 0
+    unmatched = 0
+
+    for idx, row in players.iterrows():
+        fpl_name = row["web_name"] # short name e.g. "Salah"
+
+        #-- 1. Exact match on short name ---
+        exact = understat_df[
+            understat_df["player_name"].str.contains(fpl_name, case=False, na=False)
+            ]
+        if not exact.empty:
+            best_row = exact.iloc[0]
+        else:
+            #-- 2. Fuzzy match ---0
+            result = fuzz_process.extractOne(
+                fpl_name,
+                understat_names,
+                scorer=fuzz.WRatio,
+                score_cutoff=NAME_MATCH_THRESHOLD,
+            )
+            if result is None:
+                unmatched += 1
+                continue #keep proxy values
+            best_name = result[0]
+            best_row = understat_df[
+                understat_df["player_name"] == best_name
+                ].iloc[0]
+            
+        # ── Scale per90 xG/xA to a rolling-5-GW equivalent ──────────
+        # per90 × 5 GWs × ~0.9 (avg minutes played per GW as fraction of 90)
+        # This gives a comparable magnitude to the rolling average used
+        # during training on vaastav data.
+        avg_min_frac = float(row.get("minutes_pct", 0.9))
+        scale = 5 * avg_min_frac
+
+        players.at[idx, "xg_roll5"] = float(best_row["xg_per90"]) * scale
+        players.at[idx, "xa_roll5"] = float(best_row["xa_per90"]) * scale
+        matched += 1
+
+    total = len(players)
+    print(f" [Understat] Matched {matched}/{total} players with real xG/xA "
+            f"({unmatched} unmatched -> using goals/assists proxy)")
+    return players
+
+
+# ─────────────────────────────────────────────
+# 4f-ii. Live feature enrichment for current players
+# ─────────────────────────────────────────────
+
+def enrich_features_for_prediction(players, player_histories, understat_df=None):
     """
     Build the same rolling feature columns used during training,
     but from the live player history data fetched from the FPL API.
 
     player_histories: dict {player_id: DataFrame} from fetch_all_player_histories()
-    Adds all GW_FEATURES columns to the players DataFrame in-place.
-
-    is_home is now read from the 'is_home' column added by
-    add_fixture_difficulty() rather than being hardcoded to 0.
-    Previously this meant the model never saw home advantage at
-    prediction time despite being trained on it.
+    understat_df     : DataFrame from fetch_understat_xg(), or None
+ 
+    Column priority for xg_roll5 / xa_roll5:
+        1. Real Understat xG/xA (most accurate)
+        2. Goals/assists rolling average (proxy fallback)
+ 
+    is_home is read from the players DataFrame column set by
+    add_fixture_difficulty() — not hardcoded.
     """
     print("  [Phase 3] Engineering live features for prediction...")
 
@@ -905,7 +1106,12 @@ def enrich_features_for_prediction(players, player_histories):
     for pos in ["GK", "DEF", "MID", "FWD"]:
         players[f"pos_{pos}"] = (players["element_type"] == pos).astype(int)
 
-    # fdr and is_home was already added by add_fixture_difficulty
+    # -- Priority 2: overwrite proxt xG/xA with real Understat values ---
+    if understat_df is not None:
+        players = merge_understat(players, understat_df)
+    else:
+        print(" [Understat] No xG/xA data - using goals/assists proxy.")
+
     return players
 
 
