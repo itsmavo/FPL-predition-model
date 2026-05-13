@@ -906,10 +906,11 @@ def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
     # -- Return cached data if fresh enough (same calendar day) ---
     if cache_path.exists():
         try:
-            cached = pd.read_csv(cache_path)
-            cached_data = pd.to_datetime(cached["fetched_at"].iloc[0]).date()
-            if cached_data == datetime.now().date():
-                print(f" [Understat] Using cached xG/xA data ({cache_path})")
+            cached      = pd.read_csv(cache_path)
+            cached_date = pd.to_datetime(cached["fetched_at"].iloc[0]).date()
+            if cached_date == datetime.now().date():
+                print(f"  [Understat] Using cached xG/xA ({len(cached)} players) "
+                      f"from {cache_path}")
                 return cached
         except Exception:
             pass # corrupt cache -- re-fetch
@@ -1097,9 +1098,9 @@ def enrich_features_for_prediction(players, player_histories, understat_df=None)
         players.at[idx, "clean_sheets_roll5"] = rolling_mean(hist, "clean_sheets", 5)
         players.at[idx, "bonus_roll5"]        = rolling_mean(hist, "bonus", 5)
 
-        # xG / xA: use goals/assists as proxy (replace with Understat merge later)
-        players.at[idx, "xg_roll5"]           = players.at[idx, "goals_roll5"]
-        players.at[idx, "xa_roll5"]           = players.at[idx, "assists_roll5"]
+        # xG / xA — proxy first; overwritten by Understat merge below
+        players.at[idx, "xg_roll5"] = players.at[idx, "goals_roll5"]
+        players.at[idx, "xa_roll5"] = players.at[idx, "assists_roll5"]
 
         # minutes_pct from latest GW
         if hist is not None and not hist.empty and "minutes" in hist.columns:
@@ -1391,6 +1392,132 @@ class SeasonTracker:
 
             conn.commit()
 
+    def auto_record_previous_gw_points(self):
+        """
+        Automatically fetch and record actual FPL points for every past
+        gameweek that has been saved to the tracker but has no actual
+        points recorded yet.
+ 
+        Called automatically on every run() — no manual input needed.
+ 
+        How it works:
+          1. Query the tracker DB for any GW selections where
+             actual_pts IS NULL (i.e. not yet recorded).
+          2. Filter to GWs that have already finished (using the FPL
+             API fixtures table to check event status).
+          3. For each such GW, fetch each player's element-summary
+             from the FPL API, find the matching GW row, and read
+             the actual total_points value.
+          4. Call record_actual_points() to persist them.
+ 
+        Skips any GW that hasn't finished yet — those will be picked
+        up automatically on the next run after the GW resolves.
+ 
+        Prints a summary of what was recorded, or a note if everything
+        is already up to date.
+        """
+        # ── Find GWs in tracker that have no actual points yet ────────
+        with self._connect() as conn:
+            pending_gws = conn.execute("""
+                SELECT DISTINCT gw FROM team_selections
+                WHERE actual_pts IS NULL
+                ORDER BY gw
+            """).fetchall()
+
+        if not pending_gws:
+            print(" [Tracker] All saved GWs already have actual points recorded.")
+            return
+        
+        pending_gws = [row[0] for row in pending_gws]
+        print(f" [Tracker] Found {len(pending_gws)} GW(s) with pending actual points:" 
+              f"{pending_gws}")
+        
+        # ── Check which of these GWs have already finished ──
+        try:
+            fixtures_resp = requests.get(
+                "https://fantasy.premierleague.com/api/fixtures/",
+                timeout=15
+                )
+            fixtures_resp.raise_for_status()
+            fixtures = pd.DataFrame(fixtures_resp.json())
+
+            finished_gws = set(
+                fixtures[fixtures["finished"] == True]["event"]
+                .dropna()
+                .astype(int)
+                .tolist()
+            )
+        except Exception as e:
+            print(f"  [Tracker] Could not fetch fixtures to check GW status: {e}")
+            return
+            
+        recordable = [gw for gw in pending_gws if gw in finished_gws]
+        skipped    = [gw for gw in pending_gws if gw not in finished_gws]
+
+        if skipped:
+            print(f"  [Tracker] GW(s) {skipped} not yet finished — skipping.")
+        if not recordable:
+            print("  [Tracker] No finished GWs pending — nothing to record.")
+            return
+
+        # ── For each recordable GW, fetch actual points per player ────
+        for gw in recordable:
+            print(f"  [Tracker] Auto-recording actual points for GW {gw}...")
+
+            # Get the player IDs we selected for that GW
+            with self._connect() as conn:
+                selected = conn.execute("""
+                    SELECT player_id FROM team_selections
+                    WHERE  gw = ? AND actual_pts IS NULL
+                """, (gw,)).fetchall()
+            player_ids = [row[0] for row in selected]
+
+            if not player_ids:
+                continue
+
+            # Fetch element-summary for each player concurrently
+            actual_points = {}
+
+            def _fetch_gw_pts(pid, target_gw):
+                try:
+                    url  = (f"https://fantasy.premierleague.com"
+                            f"/api/element-summary/{pid}/")
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    history = resp.json().get("history", [])
+                    for entry in history:
+                        if int(entry.get("round", 0)) == target_gw:
+                            return pid, int(entry.get("total_points", 0))
+                    return pid, None   # player had no appearance that GW
+                except Exception:
+                    return pid, None
+            
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=MAX_FORM_WORKERS) as executor:
+                futures = {
+                    executor.submit(_fetch_gw_pts, pid, gw): pid
+                    for pid in player_ids
+                }
+                for future in as_completed(futures):
+                    pid, pts = future.result()
+                    if pts is not None:
+                        actual_points[pid] = pts
+
+            if not actual_points:
+                print(f"  [Tracker] No points data found for GW {gw} — "
+                      f"GW may not have resolved yet.")
+                continue
+
+            # Bench / non-playing players score 0
+            for pid in player_ids:
+                if pid not in actual_points:
+                    actual_points[pid] = 0
+
+            self.record_actual_points(gw=gw, actual_points=actual_points)
+            found = sum(1 for p in actual_points.values() if p > 0)
+            print(f"  [Tracker] ✓ GW {gw} recorded: "
+                  f"{found}/{len(player_ids)} players scored > 0 pts")
+
     def get_gw_selection(self, gw):
         """Retrieve the stored squad for a specific GW as a DataFrame."""
         with self._connect() as conn:
@@ -1557,12 +1684,18 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     should_force = force_retrain or (
         tracker is not None and should_retrain(tracker)
     )
+
+    # ── Auto-record actual points for any past GWs that have resolved
+    if tracker is not None:
+        tracker.auto_record_previous_gw_points()
+
     gw_model, season_model, cap_model = load_or_train_models(
         force_retrain=should_force
     )
 
     # ── 7. Enrich live features ──────────────────────────────────────
-    players = enrich_features_for_prediction(players, player_histories)
+    understat_df = fetch_understat_xg()
+    players = enrich_features_for_prediction(players, player_histories, understat_df=understat_df)
 
     # ── 8. ML predictions (overwrite heuristic if model available) ──
     if mode == "season":
