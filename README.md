@@ -114,7 +114,7 @@ fpl_env\Scripts\activate
 ### 3. Install dependencies
  
 ```bash
-pip install requests pandas pulp numpy lightgbm xgboost scikit-learn joblib
+pip install requests pandas pulp numpy lightgbm xgboost scikit-learn joblib rapidfuzz
 ```
  
 Full dependency list:
