@@ -116,7 +116,7 @@ RETRAIN_MAE_TRIGGER = 3.5  # if rolling 5-GW MAE exceeds this, auto-retrain
 MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little data)
 
 # Priority 2 - Understat config
-UNDERSTAT_SEASON = "2024" # year the current PL season started (e.g. "2024" for 2024-25)
+UNDERSTAT_SEASON = "2025" # year the current PL season started (e.g. "2024" for 2024-25)
 
 UNDERSTAT_CACHE = Path("understat_cache.csv") # avoid re-fetching every run
 NAME_MATCH_THRESHOLD = 75 # rapidfuzz score (0-100); below this = no match
@@ -883,176 +883,86 @@ def load_or_train_models(force_retrain=False):
 # 4f-i. Understat xG / xA fetch (Priority 2)
 # ─────────────────────────────────────────────
 
-def fetch_understat_xg(season=UNDERSTAT_SEASON, cache_path=UNDERSTAT_CACHE):
+def extract_xg_from_histories(player_histories):
     """
-    Fetch per-player xG and xA for the current Premier League season
-    from Understat using a plain HTTP scrape — no aiohttp or understat
-    library required. Works on Python 3.12+.
+Extract real xG and xA from the player history data already fetched
+    from the FPL element-summary API — no Understat or external source needed.
  
-    Understat embeds player data as a JSON blob inside a <script> tag
-    on their league page. We extract it with a regex and parse it
-    directly, bypassing the broken aiohttp wheel build entirely.
+    The FPL API has included per-match expected stats since 2022-23:
+        expected_goals           — xG per appearance
+        expected_assists         — xA per appearance
+        expected_goal_involvements — xGI per appearance
+        expected_goals_conceded  — xGC per appearance (DEF/GK)
  
-    Returns a DataFrame with columns:
-        player_name, xg_per90, xa_per90, total_xg, total_xa,
-        minutes, fetched_at
+    These are already in the history DataFrames fetched by
+    fetch_all_player_histories(). This function reads those fields
+    and computes rolling 5-GW averages, returning a dict:
+        {player_id: {"xg_roll5": float, "xa_roll5": float}}
  
-    Results are cached to UNDERSTAT_CACHE (CSV) for the rest of the
-    calendar day — delete the file to force a fresh fetch.
- 
-    Returns None on any failure — caller falls back to goals/assists proxy.
+    Falls back to None for any player whose history lacks these fields
+    (e.g. data from before 2022-23 in the vaastav training set).
     """
-    
-    # -- Return cached data if fresh enough (same calendar day) ---
-    if cache_path.exists():
-        try:
-            cached      = pd.read_csv(cache_path)
-            cached_date = pd.to_datetime(cached["fetched_at"].iloc[0]).date()
-            if cached_date == datetime.now().date():
-                print(f"  [Understat] Using cached xG/xA ({len(cached)} players) "
-                      f"from {cache_path}")
-                return cached
-        except Exception:
-            pass # corrupt cache -- re-fetch
+    results = {}
+    native_found = 0
+    native_missing = 0
 
-    print(f" [Understat] Scraping xG/xA for {season} season...")
-    try:
-            url = f"https://understat.com/league/EPL/{season}"
-            resp = requests.get(url,timeout=20, 
-                                headers={"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36")}
-                )
-            resp.raise_for_status()
+    for pid, hist in player_histories.items():
+        if hist is None or hist.empty:
+            results[pid] = None
+            native_missing += 1
+            continue
 
-            # Understat embeds: var playersData = JSON.parse('...')
-            # The inner string is unicode-escaped JSON
-            match = re.search(r"var\s+playersData\s*=\s*JSON\.parse\('(.+?)'\)", 
-                              resp.text,
-                              re.DOTALL)
-            if not match:
-                print(" [Understat] Could not find playersData in page."
-                      " Understat may have changed their page structure.")
-                return None
+        has_xg = "expected_goals" in hist.columns
+        has_xa = "expected_assists" in hist.columns
 
-            # Decode the unicode-escaped string then parse JSON
-            raw_json = match.group(1).encode("utf-8").decode("unicode_escape")
-            raw = json.loads(raw_json)
-            rows = []
-            for p in raw:
-                try:
-                    mins = float(p.get("time", 0) or 0)
-                    xg = float(p.get("xG", 0) or 0)
-                    xa = float(p.get("xA", 0) or 0)
-                    if mins < 1:
-                        continue
-                    per90 = mins / 90
-                    rows.append({
-                        "player_name": p.get("player_name", ""),
-                        "xg_per90": round(xg / per90, 4),
-                        "xa_per90": round(xa / per90, 4),
-                        "total_xg": round(xg, 4),
-                        "total_xa": round(xa, 4),
-                        "minutes": mins,
-                        "fetched_at": datetime.now().isoformat(),
-                    })
-                except (TypeError, ValueError, ZeroDivisionError):
-                    continue
+        if has_xg and has_xa:
+            xg_vals = pd.to_numeric(hist["expected_goals"], errors="coerce").fillna(0)
+            xa_vals = pd.to_numeric(hist["expected_assists"], errors="coerce").fillna(0)
+            results[pid] = {
+                "xg_roll5": float(xg_vals.tail(5).mean()),
+                "xa_roll5": float(xa_vals.tail(5).mean()),
+            }
+            native_found += 1
+        else:
+            results[pid] = None
+            native_missing += 1
 
-            if not rows:
-                print(" [Understat] No player data returned.")
-                return None
-            
-            df = pd.DataFrame(rows)
-            df.to_csv(cache_path, index=False)
-            print(f" [Understat] Fetched {len(df)} players. Cached -> {cache_path}")
-            return df
-    except requests.exceptions.Timeout:
-        print(" [Understat] Request timed out. Falling back to goals/assists proxy.")
-        return None
-    except requests.exceptions.HTTPError as e:
-        print(f" [Understat] HTTP error: {e}. Falling back to goals/assists proxy.")
-        return None
-      
-    except Exception as e:
-        print(f" [Understat] Scrape failed: {e}. Falling back to goals/assists proxy.")
-        return None
+    total = native_found + native_missing
+    if total > 0:
+        print(f"  [xG/xA] Native FPL fields found for "
+              f"{native_found}/{total} players found, "
+              f"{native_missing}/{total} missing.")
+    return results
 
-def merge_understat(players, understat_df):
+def merge_native_xg(players, xg_data):
     """
-    Fuzzy-match FPL player names to Understat player names and add
-    xg_roll5 / xa_roll5 columns derived from real xG/xA data.
+     Apply native FPL xG/xA values to the players DataFrame.
  
-    Why fuzzy matching:
-        FPL uses "Alexander-Arnold"; Understat uses "Trent Alexander-Arnold"
-        FPL uses "Salah"; Understat uses "Mohamed Salah"
-        Direct string joins fail on ~40% of players without this step.
+    xg_data: dict {player_id: {"xg_roll5": float, "xa_roll5": float}}
+              returned by extract_xg_from_histories().
  
-    Match strategy:
-        1. Try exact match on web_name (FPL short name) first
-        2. Try exact match on full name where available
-        3. Fuzzy match using rapidfuzz WRatio scorer
-        4. If score < NAME_MATCH_THRESHOLD → no match, use proxy
+    Because we use player_id as the key — the same ID used throughout
+    the FPL API — there is no name matching needed. Every player either
+    has real xG/xA from their own history or keeps the goals/assists proxy.
  
-    Adds two columns to players:
-        xg_roll5  — rolling 5-GW xG average (scaled from season per90)
-        xa_roll5  — rolling 5-GW xA average (scaled from season per90)
- 
-    Players without a match keep their goals/assists proxy values.
- 
-    Requires:  pip install rapidfuzz
+    Updates xg_roll5 and xa_roll5 in-place for all matched players.
     """
-    if understat_df is None or understat_df.empty:
+    if not xg_data:
         return players
-    
-    if not RAPIDFUZZ_AVAILABLE:
-        print(" [Understat] rapidfuzz not available -- skipping name merge.")
-        return players
-    
-    understat_names = understat_df["player_name"].tolist()
 
     matched = 0
     unmatched = 0
 
     for idx, row in players.iterrows():
-        fpl_name = row["web_name"] # short name e.g. "Salah"
-
-        #-- 1. Exact match on short name ---
-        exact = understat_df[
-            understat_df["player_name"].str.contains(fpl_name, case=False, na=False)
-            ]
-        if not exact.empty:
-            best_row = exact.iloc[0]
+        pid = row["id"]
+        vals = xg_data.get(pid)
+        if vals is not None:
+            players.at[idx, "xg_roll5"] = vals.get("xg_roll5", row["xg_roll5"])
+            players.at[idx, "xa_roll5"] = vals.get("xa_roll5", row["xa_roll5"])
+            matched += 1
         else:
-            #-- 2. Fuzzy match ---0
-            result = fuzz_process.extractOne(
-                fpl_name,
-                understat_names,
-                scorer=fuzz.WRatio,
-                score_cutoff=NAME_MATCH_THRESHOLD,
-            )
-            if result is None:
-                unmatched += 1
-                continue #keep proxy values
-            best_name = result[0]
-            best_row = understat_df[
-                understat_df["player_name"] == best_name
-                ].iloc[0]
-            
-        # ── Scale per90 xG/xA to a rolling-5-GW equivalent ──────────
-        # per90 × 5 GWs × ~0.9 (avg minutes played per GW as fraction of 90)
-        # This gives a comparable magnitude to the rolling average used
-        # during training on vaastav data.
-        avg_min_frac = float(row.get("minutes_pct", 0.9))
-        scale = 5 * avg_min_frac
+            unmatched += 1
 
-        players.at[idx, "xg_roll5"] = float(best_row["xg_per90"]) * scale
-        players.at[idx, "xa_roll5"] = float(best_row["xa_per90"]) * scale
-        matched += 1
-
-    total = len(players)
-    print(f" [Understat] Matched {matched}/{total} players with real xG/xA "
-            f"({unmatched} unmatched -> using goals/assists proxy)")
     return players
 
 
@@ -1060,7 +970,7 @@ def merge_understat(players, understat_df):
 # 4f-ii. Live feature enrichment for current players
 # ─────────────────────────────────────────────
 
-def enrich_features_for_prediction(players, player_histories, understat_df=None):
+def enrich_features_for_prediction(players, player_histories):
     """
     Build the same rolling feature columns used during training,
     but from the live player history data fetched from the FPL API.
@@ -1069,7 +979,7 @@ def enrich_features_for_prediction(players, player_histories, understat_df=None)
     understat_df     : DataFrame from fetch_understat_xg(), or None
  
     Column priority for xg_roll5 / xa_roll5:
-        1. Real Understat xG/xA (most accurate)
+        1. FPL native expected_goals / expected_assists  (most accurate)
         2. Goals/assists rolling average (proxy fallback)
  
     is_home is read from the players DataFrame column set by
@@ -1122,10 +1032,11 @@ def enrich_features_for_prediction(players, player_histories, understat_df=None)
         players[f"pos_{pos}"] = (players["element_type"] == pos).astype(int)
 
     # -- Priority 2: overwrite proxt xG/xA with real Understat values ---
-    if understat_df is not None:
-        players = merge_understat(players, understat_df)
+    if player_histories is not None:
+        xg_data = extract_xg_from_histories(player_histories)
+        players = merge_native_xg(players, xg_data)
     else:
-        print(" [Understat] No xG/xA data - using goals/assists proxy.")
+        print(" [Native] No xG/xA data - using goals/assists proxy.")
 
     return players
 
@@ -1539,6 +1450,16 @@ class SeasonTracker:
                 "SELECT * FROM team_selections", conn
             )
 
+        # Coerce all numeric colmns up front - SQLite + pandas can return
+        # bytes or object dtype on some driver versions, breaking f-string
+        # format specs lik : .1f
+        for col in ["total_predicted", "total_actual", "prediction_error"]:
+            if col in meta.columns:
+                meta[col] = pd.to_numeric(meta[col], errors="coerce")
+        for col in ["predicted_pts", "actual_pts"]:
+            if col in selections.columns:
+                selections[col] = pd.to_numeric(selections[col], errors="coerce")
+
         if meta.empty:
             print("No GWs tracked yet.")
             return
@@ -1550,6 +1471,14 @@ class SeasonTracker:
 
         completed = meta.dropna(subset=["total_actual"])
         if not completed.empty:
+            # Coerce to numeric - guards against bytes/Decimal from SQLite
+
+            completed = completed.copy()
+            completed["total_actual"] = pd.to_numeric(completed["total_actual"], errors="coerce")
+            completed["total_predicted"] = pd.to_numeric(completed["total_predicted"], errors="coerce")
+            completed["prediction_error"] = pd.to_numeric(completed["prediction_error"], errors="coerce")
+            completed = completed.dropna(subset=["total_actual", "total_predicted", "prediction_error"])
+
             print(f"  GWs resolved : {len(completed)}")
             print(f"  Total actual : {completed['total_actual'].sum():.0f} pts")
             print(f"  Avg per GW   : {completed['total_actual'].mean():.1f} pts")
@@ -1567,10 +1496,26 @@ class SeasonTracker:
             print(f"  {'GW':>4}  {'Mode':>6}  {'Predicted':>10}  {'Actual':>8}  {'Error':>8}")
             print("  " + "-" * 44)
             for _, row in meta.iterrows():
-                actual = f"{row['total_actual']:.0f}" if pd.notna(row["total_actual"]) else "pending"
-                error  = f"{row['prediction_error']:+.1f}" if pd.notna(row["prediction_error"]) else "—"
+
+                try:
+                    total_pred = float(row["total_predicted"])
+                except (ValueError, TypeError):
+                    total_pred = 0.0
+
+                try:
+                    total_act = float(row["total_actual"]) if pd.notna(row["total_actual"]) else None
+                except (ValueError, TypeError):
+                    total_act = None
+
+                try:
+                    pred_err = float(row["prediction_error"]) if pd.notna(row["prediction_error"]) else None
+                except (ValueError, TypeError):
+                    pred_err = None
+
+                actual = f"{total_act:.0f}" if total_act is not None else "pending"
+                error  = f"{pred_err:+.1f}" if pred_err is not None else "—"
                 print(f"  {int(row['gw']):>4}  {row['mode']:>6}  "
-                      f"{row['total_predicted']:>10.1f}  {actual:>8}  {error:>8}")
+                      f"{total_pred:>10.1f}  {actual:>8}  {error:>8}")
 
         print("═" * 55 + "\n")
 
@@ -1694,8 +1639,7 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     )
 
     # ── 7. Enrich live features ──────────────────────────────────────
-    understat_df = fetch_understat_xg()
-    players = enrich_features_for_prediction(players, player_histories, understat_df=understat_df)
+    players = enrich_features_for_prediction(players, player_histories)
 
     # ── 8. ML predictions (overwrite heuristic if model available) ──
     if mode == "season":
