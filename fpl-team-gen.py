@@ -82,19 +82,6 @@ except ImportError:
     warnings.warn("scikit-learn / joblib not installed. Run: pip install scikit-learn joblib")
 
 # Priority 2 — Understat xG/xA via HTTP scraper (no aiohttp/understat lib needed)
-# Uses plain requests + regex to extract the JSON blob Understat embeds in
-# their league pages. Works on all Python versions including 3.12.
-import json
-import re
-UNDERSTAT_AVAILABLE = True # uses plain requests - no extra install needed
-    
-try:
-    from rapidfuzz import process as fuzz_process, fuzz
-    RAPIDFUZZ_AVAILABLE = True
-except ImportError:
-    RAPIDFUZZ_AVAILABLE = False
-    warnings.warn("rapidfuzz not installed - Understat name matching disabled. "
-                  "Run: pip install rapidfuzz")
 
 # ──────────────────────────────────────────────
 # Constants
@@ -102,7 +89,7 @@ except ImportError:
 FORM_WEIGHT         = 0.28
 TOTAL_POINTS_WEIGHT = 0.72
 FDR_WEIGHT          = 0.15          # penalty applied on top of weighted score
-MIN_MINUTES         = 450           # ~5 full games
+MIN_MINUTES         = 45          # ~5 full games
 MAX_FORM_WORKERS    = 10            # concurrent API requests for player history
 DB_PATH             = "fpl_tracker.db"
 
@@ -618,14 +605,29 @@ class FPLModel:
         if self.model is None:
             print("  [FPLModel] No model loaded — using heuristic fallback.")
             return players   # heuristic was already applied upstream
+        
+        if players.empty:
+            print("  [FPLModel] Warning: players DataFrame is empty - "
+                  "check MIN_MINUTES or API response.")
+            return players
 
         available = [f for f in self.features if f in players.columns]
+        if not available:
+            print("  [FPLModel] No usable features found — using heuristic fallback.")
+            return players
+
         missing   = [f for f in self.features if f not in players.columns]
         if missing:
+            print(f"  [FPLModel] Filling {len(missing)} missing feature(s) " 
+                  f" with 0: {missing}")
             for col in missing:
                 players[col] = 0   # fill any absent live features with 0
 
-        X = players[self.features].fillna(0)
+        X = players[available].fillna(0)
+
+        if X.empty or X.shape[0] == 0:
+            print("  [FPLModel] Warning: feature matrix is empty — using heuristic fallback.")
+            return players
         players["predicted_points"] = self.model.predict(X).clip(min=0)
         print(f"  [FPLModel] Predictions generated for {len(players)} players.")
         return players
@@ -724,10 +726,21 @@ class FPLSeasonModel:
             print("  [FPLSeasonModel] No model — using total_points as proxy.")
             players["season_predicted_points"] = players["total_points"]
             return players
+
+        if players.empty:
+            print("  [FPLSeasonModel] Warning: players DataFrame is empty.")
+            players["season_predicted_points"] = 0
+            return players
+
+        missing = [f for f in self.features if f not in players.columns]
+        if missing:
+            for col in missing:
+                players[col] = 0
+        
         available = [f for f in self.features if f in players.columns]
         for col in [f for f in self.features if f not in players.columns]:
             players[col] = 0
-        X = players[self.features].fillna(0)
+        X = players[available].fillna(0)
         players["season_predicted_points"] = self.model.predict(X).clip(min=0)
         return players
 
@@ -1642,6 +1655,14 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     players = enrich_features_for_prediction(players, player_histories)
 
     # ── 8. ML predictions (overwrite heuristic if model available) ──
+    print(f" Players entering prediction: {len(players)}")
+    if players.empty:
+        raise RuntimeError(
+            "No players remain after preprocessing. "
+            f"Check MIN_MINUTES ({MIN_MINUTES}) - it may be too high "
+            "for early season when players have few minutes played."
+            "Try lowering it to 45 - 270 for early GWs."
+        )
     if mode == "season":
         players = season_model.predict(players)
         # Map season_predicted_points → predicted_points for optimizer
