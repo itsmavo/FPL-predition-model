@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FPL Team Generator — v3.0
+FPL Team Generator — v4.0
 Fixes applied (v2):
   - update_predicted_points no longer overwrites the weighted formula
   - add_fixture_difficulty now correctly targets the next unplayed GW only
@@ -14,26 +14,18 @@ Phase 2 additions:
   - get_gw_selection(): retrieve any past GW's squad from the DB
 Phase 3 additions:
   - FPLModel: LightGBM model trained on vaastav historical dataset
-    * build_training_data(): loads and engineers features from CSV history files
-    * train(): fits LGBMRegressor with early stopping on a validation split
-    * predict(): generates next-GW point predictions for current players
-    * save() / load(): persist trained model to disk, skip retraining each run
   - FPLSeasonModel: XGBoost model for remainder-of-season point prediction
-    * Same interface as FPLModel but targets cumulative season remainder points
-    * Used when run(mode='season') is called
   - CaptaincyModel: GradientBoosting classifier for haul probability (≥12 pts)
-    * predict_proba() ranks players by captain upside, not just mean prediction
-  - Heuristic fallback: if no trained model exists and no vaastav data is
-    present, the system falls back gracefully to the v2 weighted formula
+  - Heuristic fallback when no trained model or vaastav data is present
   - New dependency: lightgbm, xgboost, scikit-learn, joblib
-    pip install lightgbm xgboost scikit-learn joblib
-    Priority 1 fix:
+Priority 1 fix:
   - add_fixture_difficulty() now maps is_home (1/0/0.5) per player
     from real fixture data instead of hardcoding 0 for all players
   - enrich_features_for_prediction() reads is_home from the players
     DataFrame rather than defaulting every player to away
 Priority 2 fix (this version):
-  - fetch_understat_xg(): pulls real xG and xA per player from the
+  - fetch_understat_xg(): replaced — xG/xA now read directly from
+    FPL element-summary API (expected_goals / expected_assists fields)
     Understat API for the current Premier League season
   - merge_understat(): fuzzy name-matches Understat players to FPL
     players using rapidfuzz, with configurable match threshold
@@ -81,7 +73,19 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     warnings.warn("scikit-learn / joblib not installed. Run: pip install scikit-learn joblib")
 
-# Priority 2 — Understat xG/xA via HTTP scraper (no aiohttp/understat lib needed)
+# Priority 2 — xG/xA read directly from FPL element-summary API
+# (expected_goals / expected_assists fields — native since 2022-23)
+# No external libraries or scraping needed.
+import json
+import re
+
+try:
+    from rapidfuzz import process as fuzz_process, fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    warnings.warn("rapidfuzz not installed — Understat name matching disabled. "
+                  "Run: pip install rapidfuzz")
 
 # ──────────────────────────────────────────────
 # Constants
@@ -89,7 +93,7 @@ except ImportError:
 FORM_WEIGHT         = 0.28
 TOTAL_POINTS_WEIGHT = 0.72
 FDR_WEIGHT          = 0.15          # penalty applied on top of weighted score
-MIN_MINUTES         = 45          # ~5 full games
+MIN_MINUTES         = 450          # ~5 full games
 MAX_FORM_WORKERS    = 10            # concurrent API requests for player history
 DB_PATH             = "fpl_tracker.db"
 
@@ -102,11 +106,9 @@ HAUL_THRESHOLD      = 12   # pts — captaincy model: what counts as a "haul"
 RETRAIN_MAE_TRIGGER = 3.5  # if rolling 5-GW MAE exceeds this, auto-retrain
 MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little data)
 
-# Priority 2 - Understat config
-UNDERSTAT_SEASON = "2025" # year the current PL season started (e.g. "2024" for 2024-25)
-
-UNDERSTAT_CACHE = Path("understat_cache.csv") # avoid re-fetching every run
-NAME_MATCH_THRESHOLD = 75 # rapidfuzz score (0-100); below this = no match
+# Priority 2 — xG/xA config
+# Native FPL API fields used directly — no external source needed
+NAME_MATCH_THRESHOLD = 75      # kept for potential future use
 
 # ML feature columns used by all three models
 GW_FEATURES = [
@@ -254,36 +256,32 @@ def calculate_form(players):
 
 def add_fixture_difficulty(players, fixtures, teams):
     """
-    FIX: Now correctly picks only the NEXT unplayed gameweek's fixture
-    per team, not the last fixture in the full list.
-    FIX: Adds null guard — blank GW teams get a neutral FDR of 3.
-    FIX:
     Picks the next unplayed gameweek's fixture per team and maps both
     FDR and home/away flag onto every player row.
- 
+
     Adds two columns to players:
         fdr      — fixture difficulty rating (1=easy … 5=hard). Neutral=3
                    for teams with a blank GW.
         is_home  — 1 if the team plays at home next GW, 0 if away,
                    0.5 for blank GW (neutral — treated as neither
                    advantage nor disadvantage by the model).
- 
+
     Previously is_home was hardcoded to 0 for all players, which meant
     the model never saw home advantage at inference time even though it
     was trained on it. This fix closes that gap.
     """
-    print("Adding fixture difficulty and home/away for next GW...")
+    print("Adding fixture difficulty and home/away flag for next GW...")
 
     team_id_to_name = dict(zip(teams["id"], teams["name"]))
     fixtures = fixtures.copy()
     fixtures["team_a"] = fixtures["team_a"].map(team_id_to_name)
     fixtures["team_h"] = fixtures["team_h"].map(team_id_to_name)
 
-    # FIX: Only look at unfinished fixtures, take the very next GW
+    # Only look at unfinished fixtures, take the very next GW
     upcoming = fixtures[fixtures["finished"] == False].copy()
     if upcoming.empty:
-        print("  Warning: No upcoming fixtures found. Using neutral FDR=3.")
-        players["fdr"] = 3
+        print("  Warning: No upcoming fixtures found. Using neutral FDR=3, is_home=0.5.")
+        players["fdr"]     = 3
         players["is_home"] = 0.5
         return players
 
@@ -291,26 +289,26 @@ def add_fixture_difficulty(players, fixtures, teams):
     next_fixes = upcoming[upcoming["event"] == next_gw]
     print(f"  Using GW {next_gw} fixtures ({len(next_fixes)} matches).")
 
-    # Build one FDR entry per team for that GW
-    fdr_dict = {}
+    # Build per-team dicts for both FDR and home flag
+    fdr_dict     = {}
     is_home_dict = {}
     for _, fixture in next_fixes.iterrows():
-        team_a = fixture["team_a"] # away side
-        team_h = fixture["team_h"] # home side
-        fdr_dict[team_h] = fixture["team_h_difficulty"]
-        fdr_dict[team_a] = fixture["team_a_difficulty"]
-        is_home_dict[team_a] = 0 # team_a plays away
-        is_home_dict[team_h] = 1 # team_h plays at home
+        team_a = fixture["team_a"]   # away side
+        team_h = fixture["team_h"]   # home side
+        fdr_dict[team_a]     = fixture["team_h_difficulty"]
+        fdr_dict[team_h]     = fixture["team_a_difficulty"]
+        is_home_dict[team_a] = 0     # team_a plays away
+        is_home_dict[team_h] = 1     # team_h plays at home
 
-    # FIX: fillna handles blank GWs — neutral difficulty, neutral home value
-    players["fdr"] = players["team"].map(fdr_dict).fillna(3)
+    # fillna handles blank GW teams: neutral difficulty, neutral home value
+    players["fdr"]     = players["team"].map(fdr_dict).fillna(3)
     players["is_home"] = players["team"].map(is_home_dict).fillna(0.5)
 
     home_count = (players["is_home"] == 1).sum()
     away_count = (players["is_home"] == 0).sum()
-    blank_count = (players["is_home"] == 0.5).sum()
+    blank_count= (players["is_home"] == 0.5).sum()
     print(f"  Home: {home_count} players | Away: {away_count} players "
-            f"| Blank GW: {blank_count} players")
+          f"| Blank GW: {blank_count} players")
 
     return players
 
@@ -600,36 +598,49 @@ class FPLModel:
     def predict(self, players):
         """
         Add 'predicted_points' column to players DataFrame.
-        Falls back to heuristic if model not available.
+        Falls back to heuristic if model not available or players is empty.
+
+        Fixes:
+          - 'available' is now actually used to build X, preventing
+            KeyError or empty DataFrame when live feature columns differ
+            from training-time feature names.
+          - Missing feature columns are filled with 0 before selection.
+          - Empty DataFrame guard added with a clear diagnostic message.
         """
         if self.model is None:
             print("  [FPLModel] No model loaded — using heuristic fallback.")
-            return players   # heuristic was already applied upstream
-        
-        if players.empty:
-            print("  [FPLModel] Warning: players DataFrame is empty - "
-                  "check MIN_MINUTES or API response.")
             return players
 
+        if players.empty:
+            print("  [FPLModel] Warning: players DataFrame is empty — "
+                  "check MIN_MINUTES filter or API response.")
+            return players
+
+        # Fill any feature columns that are absent from the live data
+        missing = [f for f in self.features if f not in players.columns]
+        if missing:
+            print(f"  [FPLModel] Filling {len(missing)} missing feature(s) "
+                  f"with 0: {missing}")
+            for col in missing:
+                players[col] = 0
+
+        # Use only features the model was trained on, in the same order
         available = [f for f in self.features if f in players.columns]
         if not available:
-            print("  [FPLModel] No usable features found — using heuristic fallback.")
+            print("  [FPLModel] No usable features found — "
+                  "using heuristic fallback.")
             return players
-
-        missing   = [f for f in self.features if f not in players.columns]
-        if missing:
-            print(f"  [FPLModel] Filling {len(missing)} missing feature(s) " 
-                  f" with 0: {missing}")
-            for col in missing:
-                players[col] = 0   # fill any absent live features with 0
 
         X = players[available].fillna(0)
 
         if X.empty or X.shape[0] == 0:
-            print("  [FPLModel] Warning: feature matrix is empty — using heuristic fallback.")
+            print("  [FPLModel] Feature matrix is empty after filtering — "
+                  "using heuristic fallback.")
             return players
+
         players["predicted_points"] = self.model.predict(X).clip(min=0)
-        print(f"  [FPLModel] Predictions generated for {len(players)} players.")
+        print(f"  [FPLModel] Predictions generated for {len(players)} players "
+              f"using {len(available)}/{len(self.features)} features.")
         return players
 
     def save(self):
@@ -736,10 +747,8 @@ class FPLSeasonModel:
         if missing:
             for col in missing:
                 players[col] = 0
-        
+
         available = [f for f in self.features if f in players.columns]
-        for col in [f for f in self.features if f not in players.columns]:
-            players[col] = 0
         X = players[available].fillna(0)
         players["season_predicted_points"] = self.model.predict(X).clip(min=0)
         return players
@@ -893,30 +902,34 @@ def load_or_train_models(force_retrain=False):
 
 
 # ─────────────────────────────────────────────
-# 4f-i. Understat xG / xA fetch (Priority 2)
+# 4f-i. Understat xG / xA fetch  (Priority 2)
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# 4f-i. xG / xA from FPL API native fields  (Priority 2 — revised)
 # ─────────────────────────────────────────────
 
 def extract_xg_from_histories(player_histories):
     """
-Extract real xG and xA from the player history data already fetched
+    Extract real xG and xA from the player history data already fetched
     from the FPL element-summary API — no Understat or external source needed.
- 
+
     The FPL API has included per-match expected stats since 2022-23:
         expected_goals           — xG per appearance
         expected_assists         — xA per appearance
         expected_goal_involvements — xGI per appearance
         expected_goals_conceded  — xGC per appearance (DEF/GK)
- 
+
     These are already in the history DataFrames fetched by
     fetch_all_player_histories(). This function reads those fields
     and computes rolling 5-GW averages, returning a dict:
         {player_id: {"xg_roll5": float, "xa_roll5": float}}
- 
+
     Falls back to None for any player whose history lacks these fields
     (e.g. data from before 2022-23 in the vaastav training set).
     """
     results = {}
-    native_found = 0
+    native_found  = 0
     native_missing = 0
 
     for pid, hist in player_histories.items():
@@ -925,12 +938,12 @@ Extract real xG and xA from the player history data already fetched
             native_missing += 1
             continue
 
-        has_xg = "expected_goals" in hist.columns
+        has_xg = "expected_goals"   in hist.columns
         has_xa = "expected_assists" in hist.columns
 
         if has_xg and has_xa:
-            xg_vals = pd.to_numeric(hist["expected_goals"], errors="coerce").fillna(0)
-            xa_vals = pd.to_numeric(hist["expected_assists"], errors="coerce").fillna(0)
+            xg_vals = pd.to_numeric(hist["expected_goals"],   errors="coerce").fillna(0)
+            xa_vals = pd.to_numeric(hist["expected_assists"],  errors="coerce").fillna(0)
             results[pid] = {
                 "xg_roll5": float(xg_vals.tail(5).mean()),
                 "xa_roll5": float(xa_vals.tail(5).mean()),
@@ -943,38 +956,39 @@ Extract real xG and xA from the player history data already fetched
     total = native_found + native_missing
     if total > 0:
         print(f"  [xG/xA] Native FPL fields found for "
-              f"{native_found}/{total} players found, "
-              f"{native_missing}/{total} missing.")
+              f"{native_found}/{total} players "
+              f"({native_missing} using goals/assists proxy)")
     return results
+
 
 def merge_native_xg(players, xg_data):
     """
-     Apply native FPL xG/xA values to the players DataFrame.
- 
+    Apply native FPL xG/xA values to the players DataFrame.
+
     xg_data: dict {player_id: {"xg_roll5": float, "xa_roll5": float}}
               returned by extract_xg_from_histories().
- 
+
     Because we use player_id as the key — the same ID used throughout
     the FPL API — there is no name matching needed. Every player either
     has real xG/xA from their own history or keeps the goals/assists proxy.
- 
+
     Updates xg_roll5 and xa_roll5 in-place for all matched players.
     """
     if not xg_data:
         return players
 
-    matched = 0
+    matched   = 0
     unmatched = 0
 
     for idx, row in players.iterrows():
-        pid = row["id"]
+        pid  = row["id"]
         vals = xg_data.get(pid)
         if vals is not None:
-            players.at[idx, "xg_roll5"] = vals.get("xg_roll5", row["xg_roll5"])
-            players.at[idx, "xa_roll5"] = vals.get("xa_roll5", row["xa_roll5"])
+            players.at[idx, "xg_roll5"] = vals["xg_roll5"]
+            players.at[idx, "xa_roll5"] = vals["xa_roll5"]
             matched += 1
         else:
-            unmatched += 1
+            unmatched += 1   # keeps goals/assists proxy set earlier
 
     return players
 
@@ -988,13 +1002,12 @@ def enrich_features_for_prediction(players, player_histories):
     Build the same rolling feature columns used during training,
     but from the live player history data fetched from the FPL API.
 
-    player_histories: dict {player_id: DataFrame} from fetch_all_player_histories()
-    understat_df     : DataFrame from fetch_understat_xg(), or None
- 
+    player_histories : dict {player_id: DataFrame}
+
     Column priority for xg_roll5 / xa_roll5:
         1. FPL native expected_goals / expected_assists  (most accurate)
-        2. Goals/assists rolling average (proxy fallback)
- 
+        2. Goals / assists rolling average               (proxy fallback)
+
     is_home is read from the players DataFrame column set by
     add_fixture_difficulty() — not hardcoded.
     """
@@ -1021,35 +1034,30 @@ def enrich_features_for_prediction(players, player_histories):
         players.at[idx, "clean_sheets_roll5"] = rolling_mean(hist, "clean_sheets", 5)
         players.at[idx, "bonus_roll5"]        = rolling_mean(hist, "bonus", 5)
 
-        # xG / xA — proxy first; overwritten by Understat merge below
+        # xG / xA — set proxy first; overwritten below if native fields exist
         players.at[idx, "xg_roll5"] = players.at[idx, "goals_roll5"]
         players.at[idx, "xa_roll5"] = players.at[idx, "assists_roll5"]
 
-        # minutes_pct from latest GW
+        # minutes_pct from most recent GW in player history
         if hist is not None and not hist.empty and "minutes" in hist.columns:
             last_mins = pd.to_numeric(hist["minutes"], errors="coerce").iloc[-1]
             players.at[idx, "minutes_pct"] = float(min(last_mins / 90, 1.0))
 
-        # is_home: read from from fixture data populated by add_fixture_difficulty()
-        # Falls back to 0.5 (neutral) if column is missing for any reason
+        # is_home from add_fixture_difficulty — falls back to 0.5 if absent
         players.at[idx, "is_home"] = float(row.get("is_home", 0.5))
 
         players.at[idx, "price"] = row["now_cost"] / 10
 
-        # transfers_in_event normalised
         t = pd.to_numeric(row.get("transfers_in_event", 0), errors="coerce") or 0
         players.at[idx, "transfers_in_event_norm"] = float(np.clip(t / 1e5, -1, 1))
 
-    # Position one-hots (already set in preprocess_data but ensure here)
+    # Position one-hots
     for pos in ["GK", "DEF", "MID", "FWD"]:
         players[f"pos_{pos}"] = (players["element_type"] == pos).astype(int)
 
-    # -- Priority 2: overwrite proxt xG/xA with real Understat values ---
-    if player_histories is not None:
-        xg_data = extract_xg_from_histories(player_histories)
-        players = merge_native_xg(players, xg_data)
-    else:
-        print(" [Native] No xG/xA data - using goals/assists proxy.")
+    # ── Priority 2: overwrite proxy xG/xA with native FPL values ──────
+    xg_data = extract_xg_from_histories(player_histories)
+    players  = merge_native_xg(players, xg_data)
 
     return players
 
@@ -1068,7 +1076,7 @@ def should_retrain(tracker: "SeasonTracker"):
             SELECT predicted_pts, actual_pts
             FROM   team_selections
             WHERE  actual_pts IS NOT NULL
-            ORDER  BY gw DESC
+            ORDER  BY season DESC, gw DESC
             LIMIT  75          -- last 5 GWs × 15 players
         """).fetchall()
 
@@ -1173,72 +1181,235 @@ def select_captain(selected_team):
 # SECTION 6 — SEASON TRACKER  (Phase 2)
 # ══════════════════════════════════════════════
 
+def season_label_from_date(d=None):
+    """
+    FPL season label for a date, e.g. 2026-11-05 -> '2026-27'.
+    A season starts in August, so July onwards belongs to the new season.
+    """
+    d = d or datetime.now()
+    start = d.year if d.month >= 7 else d.year - 1
+    return f"{start}-{(start + 1) % 100:02d}"
+
+
+def detect_season_label(bootstrap=None):
+    """
+    Work out which season the live FPL API is currently serving.
+    GW1's deadline always falls in August, so its year is the season's
+    start year. Falls back to the calendar if the payload has no events.
+    """
+    try:
+        first = pd.to_datetime(bootstrap["events"][0]["deadline_time"])
+        return season_label_from_date(first)
+    except Exception:
+        return season_label_from_date()
+
+
 class SeasonTracker:
     """
-    Persists every GW squad selection to an SQLite database.
+    Persists every GW squad selection to an SQLite database, keyed by
+    SEASON as well as gameweek so a new season never overwrites an old one.
 
     Tables:
-      team_selections  — one row per (gw, player); stores predicted &
-                         actual points, price, captain flag.
-      season_meta      — one row per GW; stores solve timestamp,
+      team_selections  — one row per (season, gw, player); stores predicted
+                         & actual points, price, captain flag.
+      season_meta      — one row per (season, gw); stores solve timestamp,
                          total predicted, total actual (filled in later).
 
+    Season handling:
+      SeasonTracker(season="2026-27")  — writes/reads that season
+      SeasonTracker()                  — reads default to the most recently
+                                         saved season; writes use the
+                                         calendar-derived season
+
+    Databases created before seasons existed are upgraded automatically
+    on first open: a timestamped backup is written, then each old row is
+    assigned a season from its saved_at date.
+
     Usage:
-      tracker = SeasonTracker()
+      tracker = SeasonTracker(season="2026-27")
       tracker.save_selection(gw=28, selected_team=df)
       tracker.record_actual_points(gw=28, actual_points={player_id: pts, ...})
       tracker.season_summary()
       tracker.get_gw_selection(gw=28)
     """
 
-    def __init__(self, db_path=DB_PATH):
+    _SELECTIONS_DDL = """
+        CREATE TABLE IF NOT EXISTS team_selections (
+            season          TEXT    NOT NULL,
+            gw              INTEGER NOT NULL,
+            player_id       INTEGER NOT NULL,
+            web_name        TEXT,
+            team            TEXT,
+            position        TEXT,
+            price           REAL,
+            predicted_pts   REAL,
+            actual_pts      REAL,
+            is_captain      INTEGER DEFAULT 0,
+            saved_at        TEXT,
+            PRIMARY KEY (season, gw, player_id)
+        )
+    """
+    _META_DDL = """
+        CREATE TABLE IF NOT EXISTS season_meta (
+            season              TEXT    NOT NULL,
+            gw                  INTEGER NOT NULL,
+            mode                TEXT,
+            total_predicted     REAL,
+            total_actual        REAL,
+            prediction_error    REAL,
+            solved_at           TEXT,
+            PRIMARY KEY (season, gw)
+        )
+    """
+
+    def __init__(self, db_path=DB_PATH, season=None):
         self.db_path = db_path
+        self.season  = season
         self._init_db()
 
     def _connect(self):
         return sqlite3.connect(self.db_path)
 
+    # ── schema + migration ────────────────────────────────────────────
+
     def _init_db(self):
-        """Create tables if they don't already exist."""
+        """Create tables, upgrading a pre-season schema first if found."""
+        if self._needs_migration():
+            self._backup_db()
+            self._migrate_legacy_schema()
         with self._connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS team_selections (
-                    gw              INTEGER NOT NULL,
-                    player_id       INTEGER NOT NULL,
-                    web_name        TEXT,
-                    team            TEXT,
-                    position        TEXT,
-                    price           REAL,
-                    predicted_pts   REAL,
-                    actual_pts      REAL,
-                    is_captain      INTEGER DEFAULT 0,
-                    saved_at        TEXT,
-                    PRIMARY KEY (gw, player_id)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS season_meta (
-                    gw                  INTEGER PRIMARY KEY,
-                    mode                TEXT,
-                    total_predicted     REAL,
-                    total_actual        REAL,
-                    prediction_error    REAL,
-                    solved_at           TEXT
-                )
-            """)
+            conn.execute(self._SELECTIONS_DDL)
+            conn.execute(self._META_DDL)
             conn.commit()
         print(f"  Season tracker ready → {os.path.abspath(self.db_path)}")
 
+    def _needs_migration(self):
+        """True if team_selections exists but has no season column."""
+        if not os.path.exists(self.db_path):
+            return False
+        conn = self._connect()
+        try:
+            cols = [r[1] for r in
+                    conn.execute("PRAGMA table_info(team_selections)").fetchall()]
+        finally:
+            conn.close()
+        return bool(cols) and "season" not in cols
+
+    def _backup_db(self):
+        import shutil
+        backup = f"{self.db_path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
+        shutil.copy2(self.db_path, backup)
+        print(f"  [Tracker] Schema upgrade — backed up existing DB → {backup}")
+
+    def _migrate_legacy_schema(self):
+        """
+        Rebuild both tables with season in the primary key. Each old row's
+        season is inferred from its saved_at / solved_at timestamp. Runs in
+        one transaction: either everything is migrated or nothing changes.
+        """
+        def season_of(ts):
+            try:
+                return season_label_from_date(pd.to_datetime(ts))
+            except Exception:
+                return "unknown"
+
+        conn = self._connect()
+        conn.isolation_level = None          # manual transaction control
+        try:
+            conn.execute("BEGIN")
+            has_meta = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='season_meta'"
+            ).fetchone() is not None
+
+            conn.execute("ALTER TABLE team_selections RENAME TO team_selections_old")
+            if has_meta:
+                conn.execute("ALTER TABLE season_meta RENAME TO season_meta_old")
+            conn.execute(self._SELECTIONS_DDL)
+            conn.execute(self._META_DDL)
+
+            old_rows = conn.execute("""
+                SELECT gw, player_id, web_name, team, position, price,
+                       predicted_pts, actual_pts, is_captain, saved_at
+                FROM   team_selections_old
+            """).fetchall()
+            conn.executemany("""
+                INSERT OR REPLACE INTO team_selections
+                  (season, gw, player_id, web_name, team, position, price,
+                   predicted_pts, actual_pts, is_captain, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [(season_of(r[9]),) + tuple(r) for r in old_rows])
+            conn.execute("DROP TABLE team_selections_old")
+
+            if has_meta:
+                old_meta = conn.execute("""
+                    SELECT gw, mode, total_predicted, total_actual,
+                           prediction_error, solved_at
+                    FROM   season_meta_old
+                """).fetchall()
+                conn.executemany("""
+                    INSERT OR REPLACE INTO season_meta
+                      (season, gw, mode, total_predicted, total_actual,
+                       prediction_error, solved_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, [(season_of(r[5]),) + tuple(r) for r in old_meta])
+                conn.execute("DROP TABLE season_meta_old")
+
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+        counts = {}
+        for r in old_rows:
+            s = season_of(r[9])
+            counts[s] = counts.get(s, 0) + 1
+        summary = ", ".join(f"{s}: {n} rows" for s, n in sorted(counts.items()))
+        print(f"  [Tracker] Migrated {len(old_rows)} existing rows → {summary}")
+
+    # ── season resolution ─────────────────────────────────────────────
+
+    def _season_for_write(self):
+        """Season used when saving a new selection."""
+        return self.season or season_label_from_date()
+
+    def _season_for_read(self, season=None):
+        """Explicit arg > tracker's season > most recently saved season."""
+        if season:
+            return season
+        if self.season:
+            return self.season
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT season FROM team_selections
+                ORDER BY saved_at DESC LIMIT 1
+            """).fetchone()
+        return row[0] if row else season_label_from_date()
+
+    def list_seasons(self):
+        """All seasons stored in the database, oldest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT season FROM team_selections ORDER BY season"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    # ── writes ────────────────────────────────────────────────────────
+
     def save_selection(self, gw, selected_team, mode="gw"):
         """
-        Persist the selected squad for a given GW.
-        Safe to call multiple times — will replace existing selection
-        for that GW (useful when re-running before deadline).
+        Persist the selected squad for a given GW of the current season.
+        Safe to call multiple times — replaces the existing selection for
+        that (season, GW) only; other seasons are never touched.
         """
-        now = datetime.now().isoformat()
+        season = self._season_for_write()
+        now    = datetime.now().isoformat()
         rows = []
         for _, player in selected_team.iterrows():
             rows.append((
+                season,
                 gw,
                 int(player["id"]),
                 player["web_name"],
@@ -1258,48 +1429,53 @@ class SeasonTracker:
             total_pred += captain["predicted_points"].iloc[0]
 
         with self._connect() as conn:
-            # Remove previous selection for this GW if re-running
-            conn.execute("DELETE FROM team_selections WHERE gw = ?", (gw,))
-            conn.execute("DELETE FROM season_meta WHERE gw = ?", (gw,))
+            # Replace this season's selection for this GW only
+            conn.execute(
+                "DELETE FROM team_selections WHERE season = ? AND gw = ?",
+                (season, gw))
+            conn.execute(
+                "DELETE FROM season_meta WHERE season = ? AND gw = ?",
+                (season, gw))
 
             conn.executemany("""
                 INSERT INTO team_selections
-                  (gw, player_id, web_name, team, position, price,
+                  (season, gw, player_id, web_name, team, position, price,
                    predicted_pts, actual_pts, is_captain, saved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
             conn.execute("""
-                INSERT INTO season_meta (gw, mode, total_predicted, solved_at)
-                VALUES (?, ?, ?, ?)
-            """, (gw, mode, total_pred, now))
+                INSERT INTO season_meta
+                  (season, gw, mode, total_predicted, solved_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (season, gw, mode, total_pred, now))
             conn.commit()
 
-        print(f"  ✓ GW {gw} selection saved ({len(rows)} players, "
+        print(f"  ✓ {season} GW {gw} selection saved ({len(rows)} players, "
               f"total predicted: {total_pred:.2f} pts)")
 
-    def record_actual_points(self, gw, actual_points: dict):
+    def record_actual_points(self, gw, actual_points: dict, season=None):
         """
         Call after a GW resolves.
         actual_points: {player_id (int): actual_points (int), ...}
-        Obtainable via the FPL API bootstrap-static 'event_points' field,
-        or by fetching each player's element-summary after the GW.
+        Only rows belonging to the given season are updated.
         """
-        print(f"Recording actual points for GW {gw}...")
+        season = self._season_for_read(season)
+        print(f"Recording actual points for {season} GW {gw}...")
         with self._connect() as conn:
             for player_id, pts in actual_points.items():
                 conn.execute("""
                     UPDATE team_selections
                     SET    actual_pts = ?
-                    WHERE  gw = ? AND player_id = ?
-                """, (pts, gw, player_id))
+                    WHERE  season = ? AND gw = ? AND player_id = ?
+                """, (pts, season, gw, player_id))
 
             # Compute GW total (captain doubled)
             rows = conn.execute("""
                 SELECT actual_pts, is_captain
                 FROM   team_selections
-                WHERE  gw = ? AND actual_pts IS NOT NULL
-            """, (gw,)).fetchall()
+                WHERE  season = ? AND gw = ? AND actual_pts IS NOT NULL
+            """, (season, gw)).fetchall()
 
             if rows:
                 total_actual = sum(
@@ -1310,58 +1486,49 @@ class SeasonTracker:
                     UPDATE season_meta
                     SET    total_actual = ?,
                            prediction_error = total_predicted - ?
-                    WHERE  gw = ?
-                """, (total_actual, total_actual, gw))
-                print(f"  ✓ GW {gw} actual total: {total_actual} pts")
+                    WHERE  season = ? AND gw = ?
+                """, (total_actual, total_actual, season, gw))
+                print(f"  ✓ {season} GW {gw} actual total: {total_actual} pts")
 
             conn.commit()
 
     def auto_record_previous_gw_points(self):
         """
-        Automatically fetch and record actual FPL points for every past
-        gameweek that has been saved to the tracker but has no actual
-        points recorded yet.
- 
-        Called automatically on every run() — no manual input needed.
- 
-        How it works:
-          1. Query the tracker DB for any GW selections where
-             actual_pts IS NULL (i.e. not yet recorded).
-          2. Filter to GWs that have already finished (using the FPL
-             API fixtures table to check event status).
-          3. For each such GW, fetch each player's element-summary
-             from the FPL API, find the matching GW row, and read
-             the actual total_points value.
-          4. Call record_actual_points() to persist them.
- 
-        Skips any GW that hasn't finished yet — those will be picked
-        up automatically on the next run after the GW resolves.
- 
-        Prints a summary of what was recorded, or a note if everything
-        is already up to date.
+        Automatically fetch and record actual FPL points for every finished
+        gameweek of the CURRENT season that was saved but has no actual
+        points yet. Called on every run().
+
+        Scoped to the current season on purpose: the FPL API only serves
+        the live season's history, so matching an older season's pending
+        rows against it would record the wrong season's points.
+
+        Skips any GW that hasn't finished — picked up on a later run.
         """
-        # ── Find GWs in tracker that have no actual points yet ────────
+        season = self._season_for_write()
+
+        # ── Find this season's GWs that have no actual points yet ─────
         with self._connect() as conn:
             pending_gws = conn.execute("""
                 SELECT DISTINCT gw FROM team_selections
-                WHERE actual_pts IS NULL
+                WHERE season = ? AND actual_pts IS NULL
                 ORDER BY gw
-            """).fetchall()
+            """, (season,)).fetchall()
 
         if not pending_gws:
-            print(" [Tracker] All saved GWs already have actual points recorded.")
+            print(f"  [Tracker] All saved {season} GWs already have actual "
+                  f"points recorded.")
             return
-        
+
         pending_gws = [row[0] for row in pending_gws]
-        print(f" [Tracker] Found {len(pending_gws)} GW(s) with pending actual points:" 
-              f"{pending_gws}")
-        
-        # ── Check which of these GWs have already finished ──
+        print(f"  [Tracker] Found {len(pending_gws)} {season} GW(s) pending "
+              f"actual points: {pending_gws}")
+
+        # ── Check which of those GWs have actually finished ───────────
         try:
             fixtures_resp = requests.get(
                 "https://fantasy.premierleague.com/api/fixtures/",
                 timeout=15
-                )
+            )
             fixtures_resp.raise_for_status()
             fixtures = pd.DataFrame(fixtures_resp.json())
 
@@ -1374,7 +1541,7 @@ class SeasonTracker:
         except Exception as e:
             print(f"  [Tracker] Could not fetch fixtures to check GW status: {e}")
             return
-            
+
         recordable = [gw for gw in pending_gws if gw in finished_gws]
         skipped    = [gw for gw in pending_gws if gw not in finished_gws]
 
@@ -1386,20 +1553,18 @@ class SeasonTracker:
 
         # ── For each recordable GW, fetch actual points per player ────
         for gw in recordable:
-            print(f"  [Tracker] Auto-recording actual points for GW {gw}...")
+            print(f"  [Tracker] Auto-recording actual points for {season} GW {gw}...")
 
-            # Get the player IDs we selected for that GW
             with self._connect() as conn:
                 selected = conn.execute("""
                     SELECT player_id FROM team_selections
-                    WHERE  gw = ? AND actual_pts IS NULL
-                """, (gw,)).fetchall()
+                    WHERE  season = ? AND gw = ? AND actual_pts IS NULL
+                """, (season, gw)).fetchall()
             player_ids = [row[0] for row in selected]
 
             if not player_ids:
                 continue
 
-            # Fetch element-summary for each player concurrently
             actual_points = {}
 
             def _fetch_gw_pts(pid, target_gw):
@@ -1415,7 +1580,7 @@ class SeasonTracker:
                     return pid, None   # player had no appearance that GW
                 except Exception:
                     return pid, None
-            
+
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=MAX_FORM_WORKERS) as executor:
                 futures = {
@@ -1437,35 +1602,44 @@ class SeasonTracker:
                 if pid not in actual_points:
                     actual_points[pid] = 0
 
-            self.record_actual_points(gw=gw, actual_points=actual_points)
+            self.record_actual_points(gw=gw, actual_points=actual_points,
+                                      season=season)
             found = sum(1 for p in actual_points.values() if p > 0)
-            print(f"  [Tracker] ✓ GW {gw} recorded: "
+            print(f"  [Tracker] ✓ {season} GW {gw} recorded: "
                   f"{found}/{len(player_ids)} players scored > 0 pts")
 
-    def get_gw_selection(self, gw):
+    # ── reads ─────────────────────────────────────────────────────────
+
+    def get_gw_selection(self, gw, season=None):
         """Retrieve the stored squad for a specific GW as a DataFrame."""
+        season = self._season_for_read(season)
         with self._connect() as conn:
             df = pd.read_sql_query(
-                "SELECT * FROM team_selections WHERE gw = ? ORDER BY position, web_name",
-                conn, params=(gw,)
+                "SELECT * FROM team_selections WHERE season = ? AND gw = ? "
+                "ORDER BY position, web_name",
+                conn, params=(season, gw)
             )
         if df.empty:
-            print(f"  No selection found for GW {gw}.")
+            print(f"  No selection found for {season} GW {gw}.")
         return df
 
-    def season_summary(self):
-        """Print a full season accuracy report across all tracked GWs."""
+    def season_summary(self, season=None):
+        """Print an accuracy report for one season (default: latest)."""
+        season  = self._season_for_read(season)
+        stored  = self.list_seasons()
         with self._connect() as conn:
             meta = pd.read_sql_query(
-                "SELECT * FROM season_meta ORDER BY gw", conn
+                "SELECT * FROM season_meta WHERE season = ? ORDER BY gw",
+                conn, params=(season,)
             )
             selections = pd.read_sql_query(
-                "SELECT * FROM team_selections", conn
+                "SELECT * FROM team_selections WHERE season = ?",
+                conn, params=(season,)
             )
 
-        # Coerce all numeric colmns up front - SQLite + pandas can return
+        # Coerce all numeric columns up front — SQLite + pandas can return
         # bytes or object dtype on some driver versions, breaking f-string
-        # format specs lik : .1f
+        # format specs like :.1f
         for col in ["total_predicted", "total_actual", "prediction_error"]:
             if col in meta.columns:
                 meta[col] = pd.to_numeric(meta[col], errors="coerce")
@@ -1474,23 +1648,25 @@ class SeasonTracker:
                 selections[col] = pd.to_numeric(selections[col], errors="coerce")
 
         if meta.empty:
-            print("No GWs tracked yet.")
+            print(f"No GWs tracked yet for season {season}.")
+            if stored:
+                print(f"  Seasons stored: {', '.join(stored)}")
             return
 
         print("\n" + "═" * 55)
-        print("  SEASON TRACKER SUMMARY")
+        print(f"  SEASON TRACKER SUMMARY — {season}")
         print("═" * 55)
+        if stored:
+            print(f"  Seasons stored: {', '.join(stored)}")
         print(f"  GWs tracked  : {len(meta)}")
 
         completed = meta.dropna(subset=["total_actual"])
         if not completed.empty:
-            # Coerce to numeric - guards against bytes/Decimal from SQLite
-
             completed = completed.copy()
-            completed["total_actual"] = pd.to_numeric(completed["total_actual"], errors="coerce")
-            completed["total_predicted"] = pd.to_numeric(completed["total_predicted"], errors="coerce")
+            completed["total_actual"]     = pd.to_numeric(completed["total_actual"],     errors="coerce")
+            completed["total_predicted"]  = pd.to_numeric(completed["total_predicted"],  errors="coerce")
             completed["prediction_error"] = pd.to_numeric(completed["prediction_error"], errors="coerce")
-            completed = completed.dropna(subset=["total_actual", "total_predicted", "prediction_error"])
+            completed = completed.dropna(subset=["total_actual"])
 
             print(f"  GWs resolved : {len(completed)}")
             print(f"  Total actual : {completed['total_actual'].sum():.0f} pts")
@@ -1500,7 +1676,7 @@ class SeasonTracker:
             print(f"  Worst GW     : GW {completed.loc[completed['total_actual'].idxmin(), 'gw']} "
                   f"({completed['total_actual'].min():.0f} pts)")
 
-            mae = selections.dropna(subset=["actual_pts"])
+            mae = selections.dropna(subset=["actual_pts"]).copy()
             if not mae.empty:
                 mae["error"] = (mae["predicted_pts"] - mae["actual_pts"]).abs()
                 print(f"  Avg pred MAE : {mae['error'].mean():.2f} pts/player")
@@ -1509,37 +1685,37 @@ class SeasonTracker:
             print(f"  {'GW':>4}  {'Mode':>6}  {'Predicted':>10}  {'Actual':>8}  {'Error':>8}")
             print("  " + "-" * 44)
             for _, row in meta.iterrows():
-
                 try:
                     total_pred = float(row["total_predicted"])
-                except (ValueError, TypeError):
+                except (TypeError, ValueError):
                     total_pred = 0.0
 
                 try:
                     total_act = float(row["total_actual"]) if pd.notna(row["total_actual"]) else None
-                except (ValueError, TypeError):
+                except (TypeError, ValueError):
                     total_act = None
 
                 try:
                     pred_err = float(row["prediction_error"]) if pd.notna(row["prediction_error"]) else None
-                except (ValueError, TypeError):
+                except (TypeError, ValueError):
                     pred_err = None
 
                 actual = f"{total_act:.0f}" if total_act is not None else "pending"
                 error  = f"{pred_err:+.1f}" if pred_err is not None else "—"
-                print(f"  {int(row['gw']):>4}  {row['mode']:>6}  "
+                print(f"  {int(row['gw']):>4}  {str(row['mode']):>6}  "
                       f"{total_pred:>10.1f}  {actual:>8}  {error:>8}")
 
         print("═" * 55 + "\n")
 
-    def get_best_gw(self):
-        """Returns the GW number with the highest actual points."""
+    def get_best_gw(self, season=None):
+        """Returns (gw, total_actual) for the season's best GW, or None."""
+        season = self._season_for_read(season)
         with self._connect() as conn:
             row = conn.execute("""
                 SELECT gw, total_actual FROM season_meta
-                WHERE  total_actual IS NOT NULL
+                WHERE  season = ? AND total_actual IS NOT NULL
                 ORDER  BY total_actual DESC LIMIT 1
-            """).fetchone()
+            """, (season,)).fetchone()
         return row  # (gw, total_actual) or None
 
 
@@ -1638,7 +1814,8 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     players = update_predicted_points(players)   # heuristic baseline
 
     # ── 6. Load / train Phase 3 ML models ───────────────────────────
-    tracker      = SeasonTracker() if save_to_tracker else None
+    tracker      = (SeasonTracker(season=detect_season_label(data))
+                    if save_to_tracker else None)
     should_force = force_retrain or (
         tracker is not None and should_retrain(tracker)
     )
@@ -1651,17 +1828,17 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
         force_retrain=should_force
     )
 
-    # ── 7. Enrich live features ──────────────────────────────────────
+    # ── 7. Enrich live features (includes native FPL xG/xA) ─────────
     players = enrich_features_for_prediction(players, player_histories)
 
-    # ── 8. ML predictions (overwrite heuristic if model available) ──
-    print(f" Players entering prediction: {len(players)}")
+    # ── 9. ML predictions (overwrite heuristic if model available) ──
+    print(f"  Players entering prediction: {len(players)}")
     if players.empty:
         raise RuntimeError(
             "No players remain after preprocessing. "
-            f"Check MIN_MINUTES ({MIN_MINUTES}) - it may be too high "
-            "for early season when players have few minutes played."
-            "Try lowering it to 45 - 270 for early GWs."
+            f"Check MIN_MINUTES ({MIN_MINUTES}) — it may be too high "
+            "for early season when players have few minutes played. "
+            "Try lowering it to 270 (3 full games)."
         )
     if mode == "season":
         players = season_model.predict(players)
@@ -1671,14 +1848,14 @@ def run(mode="gw", gw=None, save_to_tracker=True, force_retrain=False):
     else:
         players = gw_model.predict(players)   # writes predicted_points directly
 
-    # ── 9 + 10. Optimise squad ───────────────────────────────────────
+    # ── 10 + 11. Optimise squad ──────────────────────────────────────
     selected_team = optimize_team(players, mode=mode)
 
-    # ── 11. Captaincy model ──────────────────────────────────────────
+    # ── 12. Captaincy model ──────────────────────────────────────────
     selected_team = cap_model.rank_captains(selected_team)
     captain       = select_captain(selected_team)
 
-    # ── 12. Output + persist ─────────────────────────────────────────
+    # ── 13. Output + persist ─────────────────────────────────────────
     output_results(selected_team, captain, mode=mode)
 
     if tracker is not None:
@@ -1792,10 +1969,18 @@ EXAMPLES
         help="Run without saving selection to the season tracker DB"
     )
 
+    parser.add_argument(
+        "--season-id",
+        metavar="LABEL",
+        default=None,
+        help="Season label for --summary/--history/--record, e.g. 2025-26 "
+             "(default: most recently saved season)"
+    )
+
     args = parser.parse_args()
 
     # ── Tracker-only commands (no team generation needed) ─────────────
-    tracker = SeasonTracker()
+    tracker = SeasonTracker(season=args.season_id)
 
     if args.summary:
         tracker.season_summary()
@@ -1900,7 +2085,7 @@ def _run_current_mode(gw=None, save_to_tracker=True):
     output_results(selected_team, captain, mode="gw")
 
     if save_to_tracker:
-        tracker = SeasonTracker()
+        tracker = SeasonTracker(season=detect_season_label(data))
         tracker.save_selection(gw=gw, selected_team=selected_team, mode="current")
 
 
