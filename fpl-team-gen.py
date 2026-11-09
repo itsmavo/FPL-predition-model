@@ -93,7 +93,7 @@ except ImportError:
 FORM_WEIGHT         = 0.28
 TOTAL_POINTS_WEIGHT = 0.72
 FDR_WEIGHT          = 0.15          # penalty applied on top of weighted score
-MIN_MINUTES         = 450          # ~5 full games
+MIN_MINUTES         = 450           # ~5 full games
 MAX_FORM_WORKERS    = 10            # concurrent API requests for player history
 DB_PATH             = "fpl_tracker.db"
 
@@ -105,6 +105,10 @@ VAASTAV_DIR         = Path("vaastav_data")    # path to vaastav CSV history file
 HAUL_THRESHOLD      = 12   # pts — captaincy model: what counts as a "haul"
 RETRAIN_MAE_TRIGGER = 3.5  # if rolling 5-GW MAE exceeds this, auto-retrain
 MIN_TRAIN_ROWS      = 500  # minimum rows needed to train (skip if too little data)
+
+# Starting XI (official FPL rules: 1 GK, 3-5 DEF, 2-5 MID, 1-3 FWD)
+STARTER_LIMITS      = {"GK": (1, 1), "DEF": (3, 5), "MID": (2, 5), "FWD": (1, 3)}
+BENCH_WEIGHT        = 0.1  # value of a bench point vs a starter's (1.0 = old behaviour)
 
 # Priority 2 — xG/xA config
 # Native FPL API fields used directly — no external source needed
@@ -1096,24 +1100,60 @@ def should_retrain(tracker: "SeasonTracker"):
 # SECTION 5 — TEAM OPTIMIZATION
 # ══════════════════════════════════════════════
 
+def _assign_bench_order(squad, score_col):
+    """
+    Number the four bench slots 1-4 (starters get 0): the spare goalkeeper
+    first, then outfield players by score, best first. This mirrors FPL's
+    auto-sub priority order.
+    """
+    squad["bench_order"] = 0
+    bench    = squad[~squad["is_starter"]]
+    keeper   = bench[bench["element_type"] == "GK"]
+    outfield = bench[bench["element_type"] != "GK"].sort_values(
+        score_col, ascending=False)
+    for rank, idx in enumerate(list(keeper.index) + list(outfield.index), 1):
+        squad.loc[idx, "bench_order"] = rank
+    return squad
+
+
 def optimize_team(players, mode="gw"):
     """
-    PuLP integer programming optimizer.
-    mode='gw'     → maximize predicted_points (next GW)
-    mode='season' → maximize total_points (season-to-date, proxy for
-                    remainder value until Phase 3 ML model is added)
+    Joint squad + starting-XI optimiser (PuLP integer programming).
+
+    Chooses the 15-man squad AND the 11 who start, together, so budget goes
+    where points are actually scored instead of onto the bench.
+
+    Squad rules : £100m, 2 GK / 5 DEF / 5 MID / 3 FWD, max 3 per club.
+    Starting XI : 1 GK, 3-5 DEF, 2-5 MID, 1-3 FWD (STARTER_LIMITS) —
+                  i.e. every legal FPL formation, e.g. 3-4-3 or 5-2-3.
+    Captain     : doubles, and must be one of the starters.
+
+    Objective   : starters' points + captain's points (double) +
+                  BENCH_WEIGHT x bench points. A small bench weight keeps
+                  a sensible, playing bench; BENCH_WEIGHT = 1.0 reproduces
+                  the old "all 15 count equally" behaviour.
+
+    mode='gw'     → maximise predicted_points (next GW)
+    mode='season' → maximise total_points (season-to-date proxy)
+
+    Returns the 15 selected players with boolean 'is_starter' and
+    'is_captain' columns and a 'bench_order' column (0 = starter).
     """
-    print(f"Optimizing team selection (mode='{mode}')...")
+    print(f"Optimizing squad + starting XI (mode='{mode}')...")
 
     objective_col = "predicted_points" if mode == "gw" else "total_points"
     problem       = pulp.LpProblem("FPL_Team_Selection", pulp.LpMaximize)
-    player_vars   = pulp.LpVariable.dicts("Player", players.index, cat="Binary")
+    player_vars   = pulp.LpVariable.dicts("Player",  players.index, cat="Binary")
+    start_vars    = pulp.LpVariable.dicts("Start",   players.index, cat="Binary")
     captain_vars  = pulp.LpVariable.dicts("Captain", players.index, cat="Binary")
 
-    # Objective: squad points + captain double
+    # Objective: starters + captain bonus + discounted bench
     problem += pulp.lpSum([
-        players.loc[i, objective_col] * player_vars[i] +
-        players.loc[i, objective_col] * captain_vars[i]
+        players.loc[i, objective_col] * (
+            (1 - BENCH_WEIGHT) * start_vars[i]
+            + BENCH_WEIGHT * player_vars[i]
+            + captain_vars[i]
+        )
         for i in players.index
     ])
 
@@ -1126,12 +1166,7 @@ def optimize_team(players, mode="gw"):
     # Squad size
     problem += pulp.lpSum([player_vars[i] for i in players.index]) == 15
 
-    # Exactly one captain, and only from selected players
-    problem += pulp.lpSum([captain_vars[i] for i in players.index]) == 1
-    for i in players.index:
-        problem += captain_vars[i] <= player_vars[i]
-
-    # Position quotas
+    # Squad position quotas
     for pos, count in [("GK", 2), ("DEF", 5), ("MID", 5), ("FWD", 3)]:
         problem += pulp.lpSum([
             player_vars[i] for i in players.index
@@ -1145,36 +1180,70 @@ def optimize_team(players, mode="gw"):
             if players.loc[i, "team"] == team
         ]) <= 3
 
+    # Starting XI: 11 players, drawn only from the squad
+    problem += pulp.lpSum([start_vars[i] for i in players.index]) == 11
+    for i in players.index:
+        problem += start_vars[i] <= player_vars[i]
+
+    # Legal formation: per-position min/max among the starters
+    for pos, (lo, hi) in STARTER_LIMITS.items():
+        in_pos = pulp.lpSum([
+            start_vars[i] for i in players.index
+            if players.loc[i, "element_type"] == pos
+        ])
+        problem += in_pos >= lo
+        problem += in_pos <= hi
+
+    # Exactly one captain, and he must be starting
+    problem += pulp.lpSum([captain_vars[i] for i in players.index]) == 1
+    for i in players.index:
+        problem += captain_vars[i] <= start_vars[i]
+
     status = problem.solve(pulp.PULP_CBC_CMD(msg=0))
     print(f"  Solver status: {pulp.LpStatus[status]}")
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(
+            f"No valid squad found (solver status: {pulp.LpStatus[status]}). "
+            f"Too few players may be passing the MIN_MINUTES ({MIN_MINUTES}) "
+            "filter — try lowering it.")
 
-    selected_indices = [i for i in players.index if pulp.value(player_vars[i]) == 1]
-    captain_index    = next((i for i in players.index if pulp.value(captain_vars[i]) == 1), None)
+    selected_indices = [i for i in players.index if pulp.value(player_vars[i]) > 0.5]
+    starter_indices  = {i for i in selected_indices if pulp.value(start_vars[i]) > 0.5}
+    captain_index    = next((i for i in players.index
+                             if pulp.value(captain_vars[i]) > 0.5), None)
 
     selected_team = players.loc[selected_indices].copy()
+    selected_team["is_starter"] = selected_team.index.isin(starter_indices)
     selected_team["is_captain"] = selected_team.index == captain_index
-    return selected_team
+    return _assign_bench_order(selected_team, objective_col)
 
 
 def select_captain(selected_team):
     """
-    Pick captain using a blend of predicted points and haul probability
-    (Phase 3) when available. Falls back to highest predicted_points.
-    The optimizer already set is_captain on the best linear choice;
-    the captaincy model can override it with a probability-aware pick.
+    Pick the captain from the STARTING XI — a benched captain would score
+    nothing. Uses a blend of predicted points and haul probability
+    (Phase 3) when available; otherwise keeps the optimiser's choice, and
+    failing that the starter with the highest predicted_points.
     """
-    if "haul_prob" in selected_team.columns:
-        norm_pts = selected_team["predicted_points"] / (
-            selected_team["predicted_points"].max() or 1
+    if "is_starter" in selected_team.columns:
+        pool = selected_team[selected_team["is_starter"] == True]
+        if pool.empty:
+            pool = selected_team
+    else:
+        pool = selected_team
+
+    if "haul_prob" in pool.columns:
+        norm_pts = pool["predicted_points"] / (
+            pool["predicted_points"].max() or 1
         )
-        score  = 0.70 * norm_pts + 0.30 * selected_team["haul_prob"]
+        score  = 0.70 * norm_pts + 0.30 * pool["haul_prob"]
         best_i = score.idxmax()
         selected_team["is_captain"] = selected_team.index == best_i
         return selected_team.loc[best_i]
-    captains = selected_team[selected_team["is_captain"] == True]
+    captains = pool[pool["is_captain"] == True]
     if not captains.empty:
         return captains.iloc[0]
-    return selected_team.loc[selected_team["predicted_points"].idxmax()]
+    return pool.loc[pool["predicted_points"].idxmax()]
 
 
 # ══════════════════════════════════════════════
@@ -1245,6 +1314,7 @@ class SeasonTracker:
             predicted_pts   REAL,
             actual_pts      REAL,
             is_captain      INTEGER DEFAULT 0,
+            is_starter      INTEGER DEFAULT 1,
             saved_at        TEXT,
             PRIMARY KEY (season, gw, player_id)
         )
@@ -1280,6 +1350,13 @@ class SeasonTracker:
         with self._connect() as conn:
             conn.execute(self._SELECTIONS_DDL)
             conn.execute(self._META_DDL)
+            cols = [r[1] for r in
+                    conn.execute("PRAGMA table_info(team_selections)").fetchall()]
+            if "is_starter" not in cols:
+                # DB predates starting-XI selection: every saved player was
+                # counted towards the total, so keep them all as starters.
+                conn.execute("ALTER TABLE team_selections "
+                             "ADD COLUMN is_starter INTEGER DEFAULT 1")
             conn.commit()
         print(f"  Season tracker ready → {os.path.abspath(self.db_path)}")
 
@@ -1419,11 +1496,17 @@ class SeasonTracker:
                 float(player["predicted_points"]),
                 None,                              # actual_pts filled later
                 int(bool(player.get("is_captain", False))),
+                int(bool(player.get("is_starter", True))),
                 now
             ))
 
-        total_pred = selected_team["predicted_points"].sum()
-        captain    = selected_team[selected_team["is_captain"] == True]
+        # Only the starting XI scores; bench players are excluded
+        if "is_starter" in selected_team.columns:
+            scoring = selected_team[selected_team["is_starter"] == True]
+        else:
+            scoring = selected_team
+        total_pred = scoring["predicted_points"].sum()
+        captain    = scoring[scoring["is_captain"] == True]
         if not captain.empty:
             # Captain points are doubled
             total_pred += captain["predicted_points"].iloc[0]
@@ -1440,8 +1523,8 @@ class SeasonTracker:
             conn.executemany("""
                 INSERT INTO team_selections
                   (season, gw, player_id, web_name, team, position, price,
-                   predicted_pts, actual_pts, is_captain, saved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   predicted_pts, actual_pts, is_captain, is_starter, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
             conn.execute("""
@@ -1475,6 +1558,7 @@ class SeasonTracker:
                 SELECT actual_pts, is_captain
                 FROM   team_selections
                 WHERE  season = ? AND gw = ? AND actual_pts IS NOT NULL
+                  AND  COALESCE(is_starter, 1) = 1
             """, (season, gw)).fetchall()
 
             if rows:
@@ -1724,28 +1808,49 @@ class SeasonTracker:
 # ══════════════════════════════════════════════
 
 def output_results(selected_team, captain, mode="gw"):
-    """Pretty-print the selected squad grouped by position."""
+    """Pretty-print the starting XI (with formation) and the bench."""
     mode_label = "Next Gameweek" if mode == "gw" else "Best Season Team"
+    has_xi   = "is_starter" in selected_team.columns
+    starters = selected_team[selected_team["is_starter"]] if has_xi else selected_team
+    bench    = selected_team[~selected_team["is_starter"]] if has_xi else selected_team.iloc[0:0]
+
+    n = {pos: int((starters["element_type"] == pos).sum())
+         for pos in ["DEF", "MID", "FWD"]}
+    formation = f"{n['DEF']}-{n['MID']}-{n['FWD']}" if has_xi else ""
+
+    def row(p):
+        cap_tag  = " ©" if p.get("is_captain") else "  "
+        cost_str = f"£{p['now_cost']/10:.1f}m"
+        return (f"  {p['element_type']:>3} {cap_tag} {p['web_name']:<22} "
+                f"{p['team']:<18} {cost_str:>6}  "
+                f"pred: {p['predicted_points']:.3f}")
+
     print(f"\n{'═'*55}")
     print(f"  OPTIMAL TEAM — {mode_label.upper()}")
+    if formation:
+        print(f"  Formation: {formation}")
     print(f"{'═'*55}")
 
+    print("  STARTING XI" if has_xi else "  SQUAD")
     for pos in ["GK", "DEF", "MID", "FWD"]:
-        subset = selected_team[selected_team["element_type"] == pos]
-        for _, p in subset.iterrows():
-            cap_tag  = " ©" if p.get("is_captain") else "  "
-            cost_str = f"£{p['now_cost']/10:.1f}m"
-            print(f"  {pos:>3} {cap_tag} {p['web_name']:<22} "
-                  f"{p['team']:<18} {cost_str:>6}  "
-                  f"pred: {p['predicted_points']:.3f}")
+        for _, p in starters[starters["element_type"] == pos].iterrows():
+            print(row(p))
 
-    total_cost  = selected_team["now_cost"].sum() / 10
-    total_pred  = selected_team["predicted_points"].sum()
-    cap_pts     = captain["predicted_points"]
+    if not bench.empty:
+        print("\n  BENCH")
+        if "bench_order" in bench.columns:
+            bench = bench.sort_values("bench_order")
+        for _, p in bench.iterrows():
+            print(row(p))
+
+    total_cost = selected_team["now_cost"].sum() / 10
+    xi_pred    = starters["predicted_points"].sum()
+    cap_pts    = captain["predicted_points"]
     print(f"\n  Captain : {captain['web_name']} ({captain['team']}) "
           f"→ {cap_pts * 2:.2f} pts (doubled)")
     print(f"  Squad cost   : £{total_cost:.1f}m / £100.0m")
-    print(f"  Total pred   : {total_pred + cap_pts:.2f} pts (inc. captain bonus)")
+    print(f"  Starting XI  : {xi_pred + cap_pts:.2f} pts predicted "
+          f"(inc. captain bonus)")
     print(f"{'═'*55}\n")
 
 
@@ -1992,7 +2097,8 @@ EXAMPLES
             print(f"\n  GW {args.history} Selection:")
             print(past[[
                 "gw", "web_name", "team", "position",
-                "price", "predicted_pts", "actual_pts", "is_captain"
+                "price", "predicted_pts", "actual_pts", "is_captain",
+                "is_starter"
             ]].to_string(index=False))
         return
 
@@ -2078,9 +2184,8 @@ def _run_current_mode(gw=None, save_to_tracker=True):
 
     selected_team = optimize_team(players, mode="gw")
 
-    # No captaincy ML — fall back to highest predicted_points
-    captain = selected_team.loc[selected_team["predicted_points"].idxmax()]
-    selected_team["is_captain"] = selected_team.index == captain.name
+    # No captaincy ML — keep the optimiser's captain (always a starter)
+    captain = select_captain(selected_team)
 
     output_results(selected_team, captain, mode="gw")
 
