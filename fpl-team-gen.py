@@ -1215,15 +1215,37 @@ def optimize_team(players, mode="gw"):
     selected_team = players.loc[selected_indices].copy()
     selected_team["is_starter"] = selected_team.index.isin(starter_indices)
     selected_team["is_captain"] = selected_team.index == captain_index
+    selected_team["is_vice"]    = False      # set by select_captain()
     return _assign_bench_order(selected_team, objective_col)
+
+
+def _pick_vice(selected_team, pool, captain_index, score):
+    """
+    Mark the vice-captain: the best-scoring other starter, preferring one
+    from a different club than the captain so a postponement or club-wide
+    rotation can't take out both. Falls back to the same club if needed.
+    """
+    selected_team["is_vice"] = False
+    others = pool[pool.index != captain_index]
+    if others.empty:
+        return None
+    captain_club = selected_team.loc[captain_index, "team"]
+    elsewhere    = others[others["team"] != captain_club]
+    candidates   = elsewhere if not elsewhere.empty else others
+    vice_index   = score.loc[candidates.index].idxmax()
+    selected_team.loc[vice_index, "is_vice"] = True
+    return vice_index
 
 
 def select_captain(selected_team):
     """
-    Pick the captain from the STARTING XI — a benched captain would score
-    nothing. Uses a blend of predicted points and haul probability
-    (Phase 3) when available; otherwise keeps the optimiser's choice, and
-    failing that the starter with the highest predicted_points.
+    Pick the captain AND vice-captain from the STARTING XI — a benched
+    armband holder would score nothing. Uses a blend of predicted points
+    and haul probability (Phase 3) when available; otherwise keeps the
+    optimiser's captain, and failing that the highest predicted_points.
+
+    Sets the 'is_captain' and 'is_vice' columns on selected_team in place
+    and returns the captain's row.
     """
     if "is_starter" in selected_team.columns:
         pool = selected_team[selected_team["is_starter"] == True]
@@ -1236,14 +1258,17 @@ def select_captain(selected_team):
         norm_pts = pool["predicted_points"] / (
             pool["predicted_points"].max() or 1
         )
-        score  = 0.70 * norm_pts + 0.30 * pool["haul_prob"]
-        best_i = score.idxmax()
-        selected_team["is_captain"] = selected_team.index == best_i
-        return selected_team.loc[best_i]
-    captains = pool[pool["is_captain"] == True]
-    if not captains.empty:
-        return captains.iloc[0]
-    return pool.loc[pool["predicted_points"].idxmax()]
+        score         = 0.70 * norm_pts + 0.30 * pool["haul_prob"]
+        captain_index = score.idxmax()
+    else:
+        score    = pool["predicted_points"]
+        flagged  = pool[pool["is_captain"] == True]
+        captain_index = (flagged.index[0] if not flagged.empty
+                         else score.idxmax())
+
+    selected_team["is_captain"] = selected_team.index == captain_index
+    _pick_vice(selected_team, pool, captain_index, score)
+    return selected_team.loc[captain_index]
 
 
 # ══════════════════════════════════════════════
@@ -1271,6 +1296,83 @@ def detect_season_label(bootstrap=None):
         return season_label_from_date(first)
     except Exception:
         return season_label_from_date()
+
+
+_POS_ORDER = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
+
+
+def compute_gw_points(rows):
+    """
+    Score one gameweek the way FPL does: auto-subs first, then captaincy.
+
+    rows : one dict per squad player with keys
+           player_id, web_name, position, is_starter, bench_order,
+           is_captain, is_vice, pts, minutes
+           minutes=None means "unknown" and is treated as "played", so with
+           no minutes data nothing is substituted and the captain stays.
+
+    Auto-subs
+      A starter with 0 minutes is replaced by the highest-priority bench
+      player who played, as long as the XI stays a legal formation
+      (STARTER_LIMITS). A goalkeeper can only be replaced by the spare
+      goalkeeper, and the spare goalkeeper can't replace an outfielder.
+
+    Captaincy
+      The captain's points count double. If he played 0 minutes, the
+      vice-captain's points count double instead. If neither played, there
+      is no bonus.
+
+    Returns {"total", "xi", "subs": [(out_row, in_row), ...],
+             "captain": row or None, "captain_passed": bool}
+    """
+    def played(r):
+        return r["minutes"] is None or r["minutes"] > 0
+
+    def legal(xi_):
+        n = {p: sum(1 for r in xi_ if r["position"] == p) for p in _POS_ORDER}
+        return all(lo <= n[p] <= hi for p, (lo, hi) in STARTER_LIMITS.items())
+
+    xi    = sorted((r for r in rows if r["is_starter"]),
+                   key=lambda r: (_POS_ORDER.get(r["position"], 9), r["player_id"]))
+    bench = sorted((r for r in rows if not r["is_starter"]),
+                   key=lambda r: (r["bench_order"] or 99, r["player_id"]))
+    subs  = []
+
+    # 1. Goalkeeper — only the spare keeper can come on
+    for gk in [r for r in xi if r["position"] == "GK" and not played(r)]:
+        spare = next((b for b in bench
+                      if b["position"] == "GK" and played(b)), None)
+        if spare is not None:
+            xi = [spare if r is gk else r for r in xi]
+            bench.remove(spare)
+            subs.append((gk, spare))
+
+    # 2. Outfield — bench priority order, formation must stay legal
+    for b in list(bench):
+        if b["position"] == "GK" or not played(b):
+            continue
+        for out in [r for r in xi if r["position"] != "GK" and not played(r)]:
+            trial = [b if r is out else r for r in xi]
+            if legal(trial):
+                xi = trial
+                bench.remove(b)
+                subs.append((out, b))
+                break
+
+    # 3. Captaincy — armband passes to the vice if the captain didn't play
+    cap  = next((r for r in rows if r["is_captain"]), None)
+    vice = next((r for r in rows if r["is_vice"]), None)
+    eff, passed = None, False
+    if cap is not None and played(cap):
+        eff = cap
+    elif vice is not None and played(vice):
+        eff, passed = vice, cap is not None
+    if eff is not None and not any(eff is r for r in xi):
+        eff = None                       # armband holder must be in the XI
+
+    total = sum(r["pts"] for r in xi) + (eff["pts"] if eff is not None else 0)
+    return {"total": total, "xi": xi, "subs": subs,
+            "captain": eff, "captain_passed": passed}
 
 
 class SeasonTracker:
@@ -1315,6 +1417,9 @@ class SeasonTracker:
             actual_pts      REAL,
             is_captain      INTEGER DEFAULT 0,
             is_starter      INTEGER DEFAULT 1,
+            is_vice         INTEGER DEFAULT 0,
+            bench_order     INTEGER DEFAULT 0,
+            actual_minutes  INTEGER,
             saved_at        TEXT,
             PRIMARY KEY (season, gw, player_id)
         )
@@ -1352,11 +1457,19 @@ class SeasonTracker:
             conn.execute(self._META_DDL)
             cols = [r[1] for r in
                     conn.execute("PRAGMA table_info(team_selections)").fetchall()]
-            if "is_starter" not in cols:
-                # DB predates starting-XI selection: every saved player was
-                # counted towards the total, so keep them all as starters.
-                conn.execute("ALTER TABLE team_selections "
-                             "ADD COLUMN is_starter INTEGER DEFAULT 1")
+            # Upgrade databases created before these columns existed. Old
+            # rows default to 'all starters, no vice, no minutes' so their
+            # recorded totals keep their original meaning.
+            wanted = {
+                "is_starter":     "INTEGER DEFAULT 1",
+                "is_vice":        "INTEGER DEFAULT 0",
+                "bench_order":    "INTEGER DEFAULT 0",
+                "actual_minutes": "INTEGER",
+            }
+            for col, col_type in wanted.items():
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE team_selections "
+                                 f"ADD COLUMN {col} {col_type}")
             conn.commit()
         print(f"  Season tracker ready → {os.path.abspath(self.db_path)}")
 
@@ -1497,6 +1610,8 @@ class SeasonTracker:
                 None,                              # actual_pts filled later
                 int(bool(player.get("is_captain", False))),
                 int(bool(player.get("is_starter", True))),
+                int(bool(player.get("is_vice", False))),
+                int(player.get("bench_order", 0) or 0),
                 now
             ))
 
@@ -1523,8 +1638,9 @@ class SeasonTracker:
             conn.executemany("""
                 INSERT INTO team_selections
                   (season, gw, player_id, web_name, team, position, price,
-                   predicted_pts, actual_pts, is_captain, is_starter, saved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   predicted_pts, actual_pts, is_captain, is_starter,
+                   is_vice, bench_order, saved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
             conn.execute("""
@@ -1537,35 +1653,50 @@ class SeasonTracker:
         print(f"  ✓ {season} GW {gw} selection saved ({len(rows)} players, "
               f"total predicted: {total_pred:.2f} pts)")
 
-    def record_actual_points(self, gw, actual_points: dict, season=None):
+    def record_actual_points(self, gw, actual_points: dict, season=None,
+                             minutes=None):
         """
         Call after a GW resolves.
         actual_points: {player_id (int): actual_points (int), ...}
+        minutes      : optional {player_id: minutes played}. With minutes the
+                       GW total follows FPL's rules — auto-subs replace
+                       starters who didn't play, and the vice-captain's
+                       points double if the captain didn't play. Without
+                       them everyone is assumed to have played.
         Only rows belonging to the given season are updated.
         """
-        season = self._season_for_read(season)
+        season  = self._season_for_read(season)
+        minutes = minutes or {}
         print(f"Recording actual points for {season} GW {gw}...")
         with self._connect() as conn:
             for player_id, pts in actual_points.items():
                 conn.execute("""
                     UPDATE team_selections
-                    SET    actual_pts = ?
+                    SET    actual_pts     = ?,
+                           actual_minutes = COALESCE(?, actual_minutes)
                     WHERE  season = ? AND gw = ? AND player_id = ?
-                """, (pts, season, gw, player_id))
+                """, (pts, minutes.get(player_id), season, gw, player_id))
 
-            # Compute GW total (captain doubled)
-            rows = conn.execute("""
-                SELECT actual_pts, is_captain
+            db_rows = conn.execute("""
+                SELECT player_id, web_name, position, is_starter, bench_order,
+                       is_captain, is_vice, actual_pts, actual_minutes
                 FROM   team_selections
                 WHERE  season = ? AND gw = ? AND actual_pts IS NOT NULL
-                  AND  COALESCE(is_starter, 1) = 1
             """, (season, gw)).fetchall()
 
-            if rows:
-                total_actual = sum(
-                    pts * 2 if is_cap else pts
-                    for pts, is_cap in rows
-                )
+            if db_rows:
+                result = compute_gw_points([{
+                    "player_id":   r[0],
+                    "web_name":    r[1],
+                    "position":    r[2],
+                    "is_starter":  bool(r[3]) if r[3] is not None else True,
+                    "bench_order": r[4] or 0,
+                    "is_captain":  bool(r[5]),
+                    "is_vice":     bool(r[6] or 0),
+                    "pts":         float(r[7]),
+                    "minutes":     r[8],
+                } for r in db_rows])
+                total_actual = result["total"]
                 conn.execute("""
                     UPDATE season_meta
                     SET    total_actual = ?,
@@ -1573,6 +1704,12 @@ class SeasonTracker:
                     WHERE  season = ? AND gw = ?
                 """, (total_actual, total_actual, season, gw))
                 print(f"  ✓ {season} GW {gw} actual total: {total_actual} pts")
+                for out, inn in result["subs"]:
+                    print(f"    ↔ Auto-sub: {out['web_name']} (0 min) → "
+                          f"{inn['web_name']} ({inn['pts']:.0f} pts)")
+                if result["captain_passed"]:
+                    print(f"    © Captain didn't play — armband passed to "
+                          f"{result['captain']['web_name']}")
 
             conn.commit()
 
@@ -1649,21 +1786,29 @@ class SeasonTracker:
             if not player_ids:
                 continue
 
-            actual_points = {}
+            actual_points, minutes_played, failed, seen_ok = {}, {}, [], 0
 
             def _fetch_gw_pts(pid, target_gw):
+                """Returns (pid, status, points, minutes); status is
+                'ok' (played), 'blank' (no fixture/appearance) or 'error'."""
                 try:
                     url  = (f"https://fantasy.premierleague.com"
                             f"/api/element-summary/{pid}/")
                     resp = requests.get(url, timeout=10)
                     resp.raise_for_status()
                     history = resp.json().get("history", [])
-                    for entry in history:
-                        if int(entry.get("round", 0)) == target_gw:
-                            return pid, int(entry.get("total_points", 0))
-                    return pid, None   # player had no appearance that GW
+                    # A double gameweek has two entries with the same round
+                    entries = [e for e in history
+                               if int(e.get("round", 0)) == target_gw]
+                    if not entries:
+                        return pid, "blank", 0, 0
+                    pts  = sum(int(e.get("total_points", 0)) for e in entries)
+                    mins = [e.get("minutes") for e in entries]
+                    mins = (None if any(m is None for m in mins)
+                            else sum(int(m) for m in mins))
+                    return pid, "ok", pts, mins
                 except Exception:
-                    return pid, None
+                    return pid, "error", None, None
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with ThreadPoolExecutor(max_workers=MAX_FORM_WORKERS) as executor:
@@ -1672,22 +1817,28 @@ class SeasonTracker:
                     for pid in player_ids
                 }
                 for future in as_completed(futures):
-                    pid, pts = future.result()
-                    if pts is not None:
-                        actual_points[pid] = pts
+                    pid, status, pts, mins = future.result()
+                    if status == "error":
+                        failed.append(pid)
+                        continue
+                    seen_ok += status == "ok"
+                    actual_points[pid] = pts
+                    if mins is not None:
+                        minutes_played[pid] = mins
 
-            if not actual_points:
+            if failed:
+                # A failed request must not be mistaken for "didn't play"
+                print(f"  [Tracker] {len(failed)} request(s) failed for GW {gw} "
+                      f"— not recording it yet; will retry on the next run.")
+                continue
+
+            if not seen_ok:
                 print(f"  [Tracker] No points data found for GW {gw} — "
                       f"GW may not have resolved yet.")
                 continue
 
-            # Bench / non-playing players score 0
-            for pid in player_ids:
-                if pid not in actual_points:
-                    actual_points[pid] = 0
-
             self.record_actual_points(gw=gw, actual_points=actual_points,
-                                      season=season)
+                                      season=season, minutes=minutes_played)
             found = sum(1 for p in actual_points.values() if p > 0)
             print(f"  [Tracker] ✓ {season} GW {gw} recorded: "
                   f"{found}/{len(player_ids)} players scored > 0 pts")
@@ -1819,7 +1970,8 @@ def output_results(selected_team, captain, mode="gw"):
     formation = f"{n['DEF']}-{n['MID']}-{n['FWD']}" if has_xi else ""
 
     def row(p):
-        cap_tag  = " ©" if p.get("is_captain") else "  "
+        cap_tag  = (" ©" if p.get("is_captain")
+                    else " V" if p.get("is_vice") else "  ")
         cost_str = f"£{p['now_cost']/10:.1f}m"
         return (f"  {p['element_type']:>3} {cap_tag} {p['web_name']:<22} "
                 f"{p['team']:<18} {cost_str:>6}  "
@@ -1837,7 +1989,7 @@ def output_results(selected_team, captain, mode="gw"):
             print(row(p))
 
     if not bench.empty:
-        print("\n  BENCH")
+        print("\n  BENCH (auto-sub order)")
         if "bench_order" in bench.columns:
             bench = bench.sort_values("bench_order")
         for _, p in bench.iterrows():
@@ -1848,6 +2000,12 @@ def output_results(selected_team, captain, mode="gw"):
     cap_pts    = captain["predicted_points"]
     print(f"\n  Captain : {captain['web_name']} ({captain['team']}) "
           f"→ {cap_pts * 2:.2f} pts (doubled)")
+    if "is_vice" in selected_team.columns:
+        vice = selected_team[selected_team["is_vice"] == True]
+        if not vice.empty:
+            v = vice.iloc[0]
+            print(f"  Vice    : {v['web_name']} ({v['team']}) — takes the "
+                  f"armband if the captain doesn't play")
     print(f"  Squad cost   : £{total_cost:.1f}m / £100.0m")
     print(f"  Starting XI  : {xi_pred + cap_pts:.2f} pts predicted "
           f"(inc. captain bonus)")
@@ -2097,8 +2255,8 @@ EXAMPLES
             print(f"\n  GW {args.history} Selection:")
             print(past[[
                 "gw", "web_name", "team", "position",
-                "price", "predicted_pts", "actual_pts", "is_captain",
-                "is_starter"
+                "price", "predicted_pts", "actual_pts", "actual_minutes",
+                "is_captain", "is_vice", "is_starter"
             ]].to_string(index=False))
         return
 
@@ -2110,16 +2268,21 @@ EXAMPLES
             return
         try:
             gw_num = int(record_args[0])
-            actual_points = {}
-            for pair in record_args[1:]:
-                pid, pts = pair.split(":")
-                actual_points[int(pid)] = int(pts)
-            tracker.record_actual_points(gw=gw_num, actual_points=actual_points)
+            actual_points, minutes = {}, {}
+            for item in record_args[1:]:
+                parts = item.split(":")
+                if len(parts) not in (2, 3):
+                    raise ValueError(f"bad entry '{item}'")
+                actual_points[int(parts[0])] = int(parts[1])
+                if len(parts) == 3:
+                    minutes[int(parts[0])] = int(parts[2])
+            tracker.record_actual_points(gw=gw_num, actual_points=actual_points,
+                                         minutes=minutes or None)
             print(f"\n  ✓ Recorded {len(actual_points)} players for GW {gw_num}")
             tracker.season_summary()
         except ValueError as e:
             print(f"Error parsing --record arguments: {e}")
-            print("  Format: --record GW player_id:pts player_id:pts ...")
+            print("  Format: --record GW player_id:pts[:minutes] ...")
         return
 
     if args.importance:
